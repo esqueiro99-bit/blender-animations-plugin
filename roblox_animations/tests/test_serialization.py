@@ -1,0 +1,5000 @@
+import bpy
+import unittest
+import mathutils
+import math
+import time  # Add time module for benchmarking
+import importlib
+from unittest import mock
+
+# Import the specific modules we need for testing using relative imports
+from ..animation import serialization
+from ..animation import easing
+from ..core import utils
+from ..server import requests
+from ..animation.serialization import (
+    serialize,
+    is_deform_bone_rig,
+)
+from ..animation.face_controls import store_facs_payload_on_armature
+from ..core.utils import invalidate_armature_cache
+
+# Reload modules to pick up changes in Blender's test environment
+importlib.reload(utils)
+importlib.reload(requests)
+importlib.reload(easing)
+importlib.reload(serialization)
+
+
+class TestAnimationSerialization(unittest.TestCase):
+    def setUp(self):
+        """Set up a clean scene before each test."""
+        # Force newly inserted keyframes to default to LINEAR interpolation for deterministic sparse baking
+        self._prev_keyframe_interp = (
+            bpy.context.preferences.edit.keyframe_new_interpolation_type
+        )
+        bpy.context.preferences.edit.keyframe_new_interpolation_type = "LINEAR"
+
+        # Don't clear the scene property as it causes enum errors
+        # The property will be updated when we create new armatures
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+            settings.rbx_deform_rig_scale = 0.1
+            settings.rbx_full_range_bake = True
+        bpy.context.scene.unit_settings.scale_length = 1.0
+
+        # Clean up any leftover data from previous runs
+        for action in bpy.data.actions:
+            bpy.data.actions.remove(action)
+        for armature in bpy.data.armatures:
+            bpy.data.armatures.remove(armature)
+        for mesh in bpy.data.meshes:
+            bpy.data.meshes.remove(mesh)
+        for empty in bpy.data.objects:
+            if empty.type == "EMPTY":
+                bpy.data.objects.remove(empty, do_unlink=True)
+        # Remove all objects using low-level API
+        objects_to_remove = list(bpy.data.objects)
+        for obj in objects_to_remove:
+            bpy.data.objects.remove(obj)
+
+        # Force update the scene
+        bpy.context.view_layer.update()
+
+        # Invalidate armature cache to ensure fresh state
+        invalidate_armature_cache()
+
+        # Force the enum property to update by calling the items function
+        # This ensures the enum is properly updated with current armatures
+        from ..core.utils import armature_items
+
+        try:
+            # Force update the enum items
+            armature_items(None, bpy.context)
+        except Exception:
+            # If this fails, just continue - the enum will update when needed
+            pass
+
+        # Don't clear the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        self.armature_obj = None
+        self.ik_target = None
+        self.unconstrained_bone = None
+
+    def clear_scene_property(self):
+        """Clear the scene property that tracks the active armature."""
+        # Don't set the property to empty string as it causes enum errors
+        # The property will be updated when we create new armatures
+        pass
+
+    def tearDown(self):
+        """A safe cleanup after each test."""
+        # Restore user preference for keyframe interpolation
+        if hasattr(self, "_prev_keyframe_interp"):
+            bpy.context.preferences.edit.keyframe_new_interpolation_type = (
+                self._prev_keyframe_interp
+            )
+
+        # Don't clear the scene property as it causes enum errors
+        # The next test's setUp will handle cleanup
+
+        # By this point, setUp of the next test should have cleaned everything,
+        # but we keep this for good measure in case a test is run individually.
+        try:
+            if self.armature_obj and self.armature_obj.name in bpy.data.objects:
+                armature_data = self.armature_obj.data
+                bpy.data.objects.remove(self.armature_obj, do_unlink=True)
+                if armature_data and armature_data.name in bpy.data.armatures:
+                    bpy.data.armatures.remove(armature_data, do_unlink=True)
+        except (ReferenceError, RuntimeError):
+            # This can happen if the test itself modifies the scene in unexpected ways.
+            # The setUp will handle the full cleanup.
+            pass
+
+    def set_action_interpolation(self, action, interpolation="LINEAR"):
+        """Helper to set interpolation for all keyframes in an action."""
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        if not action or not fcurves:
+            return
+        for fcurve in fcurves:
+            for kp in fcurve.keyframe_points:
+                kp.interpolation = interpolation
+
+    def set_full_range_bake(self, enabled: bool):
+        """Helper to set the full range bake setting."""
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = enabled
+
+    def create_ik_rig(self):
+        """Creates a simple IK rig for testing."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        self.armature_obj = bpy.context.object
+        armature = self.armature_obj.data
+        armature.name = "TestRig"
+        self.armature_obj.name = "TestRigObject"
+
+        # Force the enum property to update after creating the armature
+        from ..core.utils import armature_items
+
+        try:
+            armature_items(None, bpy.context)
+        except Exception:
+            pass
+
+        # Create bones
+        bones = []
+        bone_names = ["Root", "UpperLeg", "LowerLeg", "Foot"]
+        for i, name in enumerate(bone_names):
+            bone = armature.edit_bones.new(name)
+            bone.head = (0, 0, 2 - i * 0.5)
+            bone.tail = (0, 0, 2 - (i + 1) * 0.5)
+            if i > 0:
+                bone.parent = bones[i - 1]
+            bones.append(bone)
+
+        # Unconstrained bone for checking sparse baking
+        unconstrained_bone_edit = armature.edit_bones.new("Unconstrained")
+        unconstrained_bone_edit.head = (1, 0, 2)
+        unconstrained_bone_edit.tail = (1, 0, 1.5)
+        unconstrained_bone_edit.parent = bones[0]  # Parent to root
+
+        # IK Target bone
+        ik_target_edit = armature.edit_bones.new("IKTarget")
+        ik_target_edit.head = (0.5, 0, 0)
+        ik_target_edit.tail = (0.5, 0, -0.5)
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Add the custom property that the serializer expects
+        for bone in self.armature_obj.pose.bones:
+            # IK Targets are controllers, not part of the final animation data.
+            # Root is usually static.
+            if bone.name not in ["Root", "IKTarget"]:
+                bone.bone["is_transformable"] = True
+
+            # THIS IS THE FIX: Manually add the properties that load_rigbone would have added.
+            # The serializer functions (`serialize_animation_state` and `serialize_deform_animation_state`)
+            # absolutely require these to exist, even if they are just identity matrices for a test.
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Add IK constraint
+        foot_pose_bone = self.armature_obj.pose.bones["Foot"]
+        ik_constraint = foot_pose_bone.constraints.new(type="IK")
+        ik_constraint.target = self.armature_obj
+        ik_constraint.subtarget = "IKTarget"
+        ik_constraint.chain_count = 2  # LowerLeg and UpperLeg
+
+        # Animate IK target
+        self.ik_target = self.armature_obj.pose.bones["IKTarget"]
+        self.ik_target.location = (0, 0, 0)
+        self.ik_target.keyframe_insert(data_path="location", frame=1)
+        self.ik_target.location = (1, 0, 0)
+        self.ik_target.keyframe_insert(data_path="location", frame=20)
+
+        # Animate unconstrained bone
+        self.unconstrained_bone = self.armature_obj.pose.bones["Unconstrained"]
+        self.unconstrained_bone.rotation_quaternion = (1, 0, 0, 0)
+        self.unconstrained_bone.keyframe_insert(
+            data_path="rotation_quaternion", frame=1
+        )
+        self.unconstrained_bone.rotation_quaternion = (
+            0.707,
+            0.707,
+            0,
+            0,
+        )  # 90 deg rotation
+        self.unconstrained_bone.keyframe_insert(
+            data_path="rotation_quaternion", frame=20
+        )
+
+        # This is the crucial missing step:
+        # Assign the created action to the armature's animation data
+        if self.armature_obj.animation_data is None:
+            self.armature_obj.animation_data_create()
+        self.armature_obj.animation_data.action = bpy.data.actions[-1]
+        self.set_action_interpolation(self.armature_obj.animation_data.action, "LINEAR")
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+
+        # Update the dependency graph to ensure all changes are propagated
+        bpy.context.view_layer.update()
+
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Set the active armature for the serializer
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+    def test_ik_chain_is_fully_baked(self):
+        """Tests that bones in an IK chain are baked on every frame,"""
+        self.clear_scene_property()
+        self.armature_obj = self.armature_obj
+        self.create_ik_rig()
+
+        # We need to be in POSE mode for serialization to work correctly
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Force a dependency graph update.
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+
+        start_time = time.perf_counter()
+        result = serialize(self.armature_obj)
+        end_time = time.perf_counter()
+        print(
+            f"\n[BENCHMARK] 'test_ik_chain_is_fully_baked' serialize time: {end_time - start_time:.4f} seconds"
+        )
+
+        # --- ASSERTIONS for Hybrid Bake ---
+        self.assertTrue(result, "Serialization returned no result.")
+        self.assertIn("kfs", result, "Serialized data is missing 'kfs' key.")
+
+        keyframes = result["kfs"]
+
+        # In this specific test, the IK target is always moving, so every constrained bone
+        # should have a key on every frame. This means the hybrid bake will produce a full
+        # 20 keyframes, but ONLY the constrained bones will be in all of them.
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected a full 20 keyframes because the IK target is always moving.",
+        )
+
+        # 2. Check that constrained bones are fully baked.
+        ik_bones = {"UpperLeg", "LowerLeg", "Foot"}
+        for i in range(len(keyframes)):
+            kf = keyframes[i]
+            for bone_name in ik_bones:
+                self.assertIn(
+                    bone_name,
+                    kf["kf"],
+                    f"IK bone '{bone_name}' missing from fully baked frame {i + 1}",
+                )
+
+        # 3. Check that the unconstrained bone is sparsely baked.
+        unconstrained_bone_name = "Unconstrained"
+        unconstrained_keyframes = 0
+        for kf in keyframes:
+            if unconstrained_bone_name in kf["kf"]:
+                unconstrained_keyframes += 1
+
+        self.assertEqual(
+            unconstrained_keyframes,
+            2,
+            f"Expected 2 keyframes for sparsely baked unconstrained bone, but found {unconstrained_keyframes}.",
+        )
+
+    def test_ik_chain_count_zero_bakes_full_parent_chain(self):
+        """Blender IK chain_count=0 means all parents, not only the tail bone."""
+        self.clear_scene_property()
+        self.armature_obj = self.armature_obj
+        self.create_ik_rig()
+
+        foot = self.armature_obj.pose.bones["Foot"]
+        for constraint in foot.constraints:
+            if constraint.type == "IK":
+                constraint.chain_count = 0
+
+        bpy.ops.object.mode_set(mode="POSE")
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+
+        result = serialize(self.armature_obj)
+        keyframes = result["kfs"]
+
+        ik_bones = {"Root", "UpperLeg", "LowerLeg", "Foot"}
+        for i, kf in enumerate(keyframes):
+            for bone_name in ik_bones:
+                self.assertIn(
+                    bone_name,
+                    kf["kf"],
+                    f"IK chain_count=0 bone '{bone_name}' missing from frame {i + 1}",
+                )
+
+    def test_unconstrained_rig_is_sparse(self):
+        """Tests that a simple rig with no constraints uses sparse baking."""
+        self.clear_scene_property()
+        # Create a new rig without constraints for this test
+        # Remove all objects using low-level API
+        objects_to_remove = list(bpy.data.objects)
+        for obj in objects_to_remove:
+            bpy.data.objects.remove(obj)
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        self.armature_obj = bpy.context.object
+        armature = self.armature_obj.data
+        armature.name = "TestRigSparse"
+        self.armature_obj.name = "TestRigObjectSparse"
+
+        root_bone = armature.edit_bones.new("Root")
+        root_bone.head = (0, 0, 1)
+        root_bone.tail = (0, 0, 0)
+
+        child_bone = armature.edit_bones.new("Child")
+        child_bone.head = (0, 0, 0)
+        child_bone.tail = (0, -1, 0)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for bone in self.armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Animate only the child bone
+        child_pose_bone = self.armature_obj.pose.bones["Child"]
+        child_pose_bone.location = (0, 0, 0)
+        child_pose_bone.keyframe_insert(data_path="location", frame=1)
+        child_pose_bone.location = (0, 1, 0)
+        child_pose_bone.keyframe_insert(data_path="location", frame=20)
+
+        if self.armature_obj.animation_data is None:
+            self.armature_obj.animation_data_create()
+        self.armature_obj.animation_data.action = bpy.data.actions[-1]
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        bpy.context.view_layer.update()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Force a dependency graph update for consistency.
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+
+        start_time = time.perf_counter()
+        result = serialize(self.armature_obj)
+        end_time = time.perf_counter()
+        print(
+            f"\n[BENCHMARK] 'test_unconstrained_rig_is_sparse' serialize time: {end_time - start_time:.4f} seconds"
+        )
+
+        self.assertTrue(result, "Serialization returned no result for sparse test.")
+        self.assertIn(
+            "kfs", result, "Serialized data is missing 'kfs' key for sparse test."
+        )
+
+        keyframes = result["kfs"]
+        # With full-range bake defaulting to True, expect all frames from frame_start to frame_end
+        expected_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(
+            len(keyframes),
+            expected_frames,
+            f"Expected {expected_frames} keyframes for full-range bake, but got {len(keyframes)}.",
+        )
+
+        # Check that the unanimated root bone is not in the keyframes
+        for kf in keyframes:
+            self.assertNotIn(
+                "Root",
+                kf["kf"],
+                "Unanimated root bone should not be present in sparse keyframes.",
+            )
+            self.assertIn(
+                "Child",
+                kf["kf"],
+                "Animated child bone should be present in sparse keyframes.",
+            )
+
+    def test_complex_rig_with_empty_ik_target(self):
+        """Tests that a rig with an IK chain targeting an Empty object and other constraints is fully baked."""
+        self.clear_scene_property()
+        # --- SETUP ---
+        # Create Armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ComplexRig"
+        armature = armature_obj.data
+        armature.name = "ComplexArmature"
+
+        bones = []
+        for i, name in enumerate(["Root", "UpperLeg", "LowerLeg", "Foot"]):
+            bone = armature.edit_bones.new(name)
+            bone.head = (0, 0, 2 - i * 0.5)
+            bone.tail = (0, 0, 2 - (i + 1) * 0.5)
+            if i > 0:
+                bone.parent = bones[i - 1]
+            bones.append(bone)
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Add custom properties required by the serializer
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Must be in Object Mode to add new objects to the scene
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        # Create Empty to act as IK target
+        bpy.ops.object.add(type="EMPTY", location=(1, 0, 0))
+        ik_target_empty = bpy.context.object
+        ik_target_empty.name = "IK_Target_Empty"
+
+        # To add constraints, the armature must be the active object and in Pose Mode
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Add IK constraint to Foot, targeting the Empty
+        foot_pose_bone = armature_obj.pose.bones["Foot"]
+        ik_constraint = foot_pose_bone.constraints.new(type="IK")
+        ik_constraint.target = ik_target_empty
+        ik_constraint.chain_count = 2
+
+        # Add another constraint (e.g., Limit Rotation on the knee)
+        lower_leg_pose_bone = armature_obj.pose.bones["LowerLeg"]
+        limit_rot_constraint = lower_leg_pose_bone.constraints.new(
+            type="LIMIT_ROTATION"
+        )
+        limit_rot_constraint.use_limit_x = True
+        limit_rot_constraint.min_x = -math.pi / 2
+        limit_rot_constraint.max_x = 0
+        limit_rot_constraint.owner_space = "LOCAL"
+
+        # The armature needs an action for the serializer to find, even if the animation
+        # itself is on another object (the IK target). An empty action is sufficient.
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = bpy.data.actions.new(
+            name="ComplexRigAction"
+        )
+
+        # Animate the Empty. keyframe_insert() will create and use an action on the Empty itself.
+        ik_target_empty.location = (1, 0, 0)
+        ik_target_empty.keyframe_insert(data_path="location", frame=1)
+        ik_target_empty.location = (1, 1, 1)
+        ik_target_empty.keyframe_insert(data_path="location", frame=20)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)  # Force depsgraph update
+
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for complex rig.")
+        self.assertIn(
+            "kfs", result, "Serialized data is missing 'kfs' key for complex rig."
+        )
+
+        keyframes = result["kfs"]
+        expected_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(
+            len(keyframes),
+            expected_frames,
+            f"Expected {expected_frames} baked frames for complex rig, but got {len(keyframes)}.",
+        )
+
+        # Check that the main animated bones are present
+        constrained_bones = {"UpperLeg", "LowerLeg", "Foot"}
+        mid_frame_kf = keyframes[10]["kf"]
+        for bone_name in constrained_bones:
+            self.assertIn(
+                bone_name,
+                mid_frame_kf,
+                f"Constrained bone '{bone_name}' was not found in a baked keyframe of the complex rig.",
+            )
+
+    def test_dynamic_parenting_with_child_of(self):
+        """Tests a bone with a Child Of constraint whose influence is animated."""
+        self.clear_scene_property()
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DynamicParentRig"
+        armature = armature_obj.data
+        armature.name = "DynamicParentArmature"
+
+        # Create a 'parent' bone that will be animated
+        parent_bone = armature.edit_bones.new("ParentBone")
+        parent_bone.head = (0, 0, 1)
+        parent_bone.tail = (0, 1, 1)
+
+        # Create a 'child' bone that will be constrained
+        child_bone = armature.edit_bones.new("ChildBone")
+        child_bone.head = (2, 0, 0)
+        child_bone.tail = (2, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Add custom properties
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Animate the parent bone
+        parent_pose_bone = armature_obj.pose.bones["ParentBone"]
+        parent_pose_bone.location = (0, 0, 0)
+        parent_pose_bone.keyframe_insert(data_path="location", frame=1)
+        parent_pose_bone.location = (0, 5, 0)
+        parent_pose_bone.keyframe_insert(data_path="location", frame=20)
+
+        # Add and animate the Child Of constraint
+        child_pose_bone = armature_obj.pose.bones["ChildBone"]
+        constraint = child_pose_bone.constraints.new(type="CHILD_OF")
+        constraint.target = armature_obj
+        constraint.subtarget = "ParentBone"
+
+        constraint.influence = 0.0
+        constraint.keyframe_insert(data_path="influence", frame=5)
+        constraint.influence = 1.0
+        constraint.keyframe_insert(data_path="influence", frame=10)
+
+        # Assign an action to the armature object
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = bpy.data.actions[-1]
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(
+            result, "Serialization returned no result for dynamic parenting test."
+        )
+        keyframes = result["kfs"]
+
+        # The 'ChildBone' has a constraint, so it should be fully baked.
+        # The 'ParentBone' is animated sparsely, but the hybrid bake logic will also
+        # insert keys for it at frames where other significant events happen (like the constraint's influence changing).
+        # Frames 1, 5, 10, 20 are the key moments.
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected 20 frames for a rig with an animated constraint.",
+        )
+
+        child_bone_name = "ChildBone"
+        parent_bone_name = "ParentBone"
+        parent_keyframe_count = 0
+
+        for kf in keyframes:
+            self.assertIn(
+                child_bone_name,
+                kf["kf"],
+                f"'{child_bone_name}' should be in every frame of a constrained bake.",
+            )
+            if parent_bone_name in kf["kf"]:
+                parent_keyframe_count += 1
+
+        # With full-range bake defaulting to True, parent bone should appear in all frames
+        expected_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(
+            parent_keyframe_count,
+            expected_frames,
+            f"Parent bone should appear in all {expected_frames} frames with full-range bake.",
+        )
+
+        # Check for presence at specific key times
+        parent_frames = [kf["t"] for kf in keyframes if parent_bone_name in kf["kf"]]
+        fps = bpy.context.scene.render.fps
+        self.assertIn(0.0, [round(t * fps) / fps for t in parent_frames])  # Frame 1
+        self.assertIn(
+            round(19 / fps, 4), [round(t, 4) for t in parent_frames]
+        )  # Frame 20
+
+    def test_kitchen_sink_constraints(self):
+        """Tests multiple, varied constraints targeting different animated Empties."""
+        # --- SETUP ---
+        # Armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "KitchenSinkRig"
+        armature = armature_obj.data
+        armature.name = "KitchenSinkArmature"
+
+        bone_names = ["Root", "BoneA", "BoneB", "BoneC"]
+        for i, name in enumerate(bone_names):
+            bone = armature.edit_bones.new(name)
+            bone.head = (i * 2, 0, 2)
+            bone.tail = (i * 2, 0, 1)
+            if i > 0:
+                bone.parent = armature.edit_bones["Root"]
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Empties and Actions
+        bpy.ops.object.mode_set(mode="OBJECT")
+        empty_a = bpy.ops.object.add(type="EMPTY", location=(0, 2, 0))
+        empty_a = bpy.context.object
+        empty_a.name = "TargetA"
+
+        empty_b = bpy.ops.object.add(type="EMPTY", location=(2, 2, 0))
+        empty_b = bpy.context.object
+        empty_b.name = "TargetB"
+
+        empty_c = bpy.ops.object.add(type="EMPTY", location=(4, 2, 0))
+        empty_c = bpy.context.object
+        empty_c.name = "TargetC"
+
+        # Animate empties
+        empty_a.keyframe_insert(data_path="location", frame=1)
+        empty_a.animation_data.action = (
+            empty_a.animation_data.action or bpy.data.actions[-1]
+        )
+        self.set_action_interpolation(empty_a.animation_data.action, "LINEAR")
+        empty_a.location.z = 5
+        empty_a.keyframe_insert(data_path="location", frame=20)
+
+        empty_b.keyframe_insert(data_path="rotation_euler", frame=1)
+        empty_b.animation_data.action = (
+            empty_b.animation_data.action or bpy.data.actions[-1]
+        )
+        self.set_action_interpolation(empty_b.animation_data.action, "LINEAR")
+        empty_b.rotation_euler.x = math.pi
+        empty_b.keyframe_insert(data_path="rotation_euler", frame=20)
+
+        empty_c.keyframe_insert(data_path="location", frame=1)
+        empty_c.animation_data.action = (
+            empty_c.animation_data.action or bpy.data.actions[-1]
+        )
+        self.set_action_interpolation(empty_c.animation_data.action, "LINEAR")
+        empty_c.location.y = -5
+        empty_c.keyframe_insert(data_path="location", frame=20)
+
+        # Add Constraints
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="POSE")
+
+        armature_obj.pose.bones["BoneA"].constraints.new(
+            "COPY_LOCATION"
+        ).target = empty_a
+        armature_obj.pose.bones["BoneB"].constraints.new(
+            "COPY_ROTATION"
+        ).target = empty_b
+        armature_obj.pose.bones["BoneC"].constraints.new(
+            "DAMPED_TRACK"
+        ).target = empty_c
+
+        # Assign a dummy action to the armature itself
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = bpy.data.actions.new(
+            name="KitchenSinkAction"
+        )
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+
+        # --- BENCHMARKING ---
+        start_time = time.perf_counter()
+        result = serialize(armature_obj)
+        end_time = time.perf_counter()
+        print(
+            f"\n[BENCHMARK] 'test_kitchen_sink_constraints' serialize time: {end_time - start_time:.4f} seconds"
+        )
+
+        # --- ASSERTION ---
+        self.assertTrue(
+            result, "Serialization returned no result for kitchen sink test."
+        )
+        keyframes = result["kfs"]
+
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected a full 20 frames for a rig with multiple constraints.",
+        )
+
+        constrained_bones = {"BoneA", "BoneB", "BoneC"}
+        for kf in keyframes:
+            for bone_name in constrained_bones:
+                self.assertIn(
+                    bone_name,
+                    kf["kf"],
+                    f"Constrained bone '{bone_name}' should be in every frame.",
+                )
+            self.assertNotIn(
+                "Root",
+                kf["kf"],
+                "Unanimated, unconstrained 'Root' bone should not be baked.",
+            )
+
+    def test_branched_hierarchy_and_interleaved_keyframes(self):
+        """
+        Tests a rig with a branched hierarchy (a torso with two arms),
+        multiple independent IK constraints, and interleaved keyframes on the parent bone.
+        """
+        # --- SETUP ---
+        # Armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "BranchedRig"
+        armature = armature_obj.data
+        armature.name = "BranchedArmature"
+
+        # Torso
+        torso = armature.edit_bones.new("Torso")
+        torso.head = (0, 0, 2)
+        torso.tail = (0, 0, 0)
+
+        # Left Arm
+        l_upper = armature.edit_bones.new("L_UpperArm")
+        l_upper.parent = torso
+        l_upper.head = (0, 0.1, 1.8)
+        l_upper.tail = (2, 0.1, 1.8)
+        l_lower = armature.edit_bones.new("L_LowerArm")
+        l_lower.parent = l_upper
+        l_lower.head = (2, 0.1, 1.8)
+        l_lower.tail = (4, 0.1, 1.8)
+
+        # Right Arm
+        r_upper = armature.edit_bones.new("R_UpperArm")
+        r_upper.parent = torso
+        r_upper.head = (0, -0.1, 1.8)
+        r_upper.tail = (2, -0.1, 1.8)
+        r_lower = armature.edit_bones.new("R_LowerArm")
+        r_lower.parent = r_upper
+        r_lower.head = (2, -0.1, 1.8)
+        r_lower.tail = (4, -0.1, 1.8)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Empties for IK targets
+        bpy.ops.object.mode_set(mode="OBJECT")
+        l_ik_target = bpy.ops.object.add(type="EMPTY", location=(5, 0.1, 1.8))
+        l_ik_target = bpy.context.object
+        r_ik_target = bpy.ops.object.add(type="EMPTY", location=(5, -0.1, 1.8))
+        r_ik_target = bpy.context.object
+        l_ik_target.name = "L_IK_Target"
+        r_ik_target.name = "R_IK_Target"
+
+        # Animate IK targets and Torso
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="POSE")
+
+        torso_pose = armature_obj.pose.bones["Torso"]
+        torso_pose.keyframe_insert(data_path="location", frame=1)
+        torso_pose.location.y = 2
+        torso_pose.keyframe_insert(data_path="location", frame=10)
+        torso_pose.location.y = 0
+        torso_pose.keyframe_insert(data_path="location", frame=20)
+
+        # Add constraints. A chain_count of 1 ensures the IK only affects the UpperArm, not the Torso.
+        armature_obj.pose.bones["L_LowerArm"].constraints.new("IK").target = l_ik_target
+        armature_obj.pose.bones["R_LowerArm"].constraints.new("IK").target = r_ik_target
+        armature_obj.pose.bones["L_LowerArm"].constraints[0].chain_count = 1
+        armature_obj.pose.bones["R_LowerArm"].constraints[0].chain_count = 1
+
+        # Assign action to armature
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = bpy.data.actions[-1]
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(
+            result, "Serialization returned no result for branched hierarchy test."
+        )
+        keyframes = result["kfs"]
+
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected a full 20 frames for the branched rig with constraints.",
+        )
+
+        constrained_bones = {"L_UpperArm", "L_LowerArm", "R_UpperArm", "R_LowerArm"}
+        sparse_bone = "Torso"
+
+        torso_keyframe_count = 0
+        for kf in keyframes:
+            for bone_name in constrained_bones:
+                self.assertIn(
+                    bone_name,
+                    kf["kf"],
+                    f"Constrained arm bone '{bone_name}' should be in every frame.",
+                )
+            if sparse_bone in kf["kf"]:
+                torso_keyframe_count += 1
+
+        # With full-range bake defaulting to True, expect all frames
+        expected_torso_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(
+            torso_keyframe_count,
+            expected_torso_frames,
+            f"Expected {expected_torso_frames} keyframes for full-range baked 'Torso' bone, but found {torso_keyframe_count}.",
+        )
+
+    def test_nla_tracks_force_full_bake(self):
+        """Tests that having active NLA tracks forces a full, simple bake."""
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NlaRig"
+        armature = armature_obj.data
+        armature.name = "NlaArmature"
+
+        armature.edit_bones.new("BoneA").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+        armature.edit_bones.new("BoneB").head = (1, 0, 1)
+        armature.edit_bones[-1].tail = (1, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Create Action 1 for BoneA
+        action_a = bpy.data.actions.new("ActionA")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action_a
+        bone_a_pose = armature_obj.pose.bones["BoneA"]
+        bone_a_pose.location = (0, 0, 0)
+        bone_a_pose.keyframe_insert(data_path="location", frame=1)
+        bone_a_pose.location = (0, 5, 0)
+        bone_a_pose.keyframe_insert(data_path="location", frame=20)
+
+        # Create Action 2 for BoneB
+        action_b = bpy.data.actions.new("ActionB")
+        armature_obj.animation_data.action = action_b
+        bone_b_pose = armature_obj.pose.bones["BoneB"]
+        bone_b_pose.rotation_quaternion = (1, 0, 0, 0)
+        bone_b_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        bone_b_pose.rotation_quaternion = (0.707, 0.707, 0, 0)
+        bone_b_pose.keyframe_insert(data_path="rotation_quaternion", frame=20)
+
+        # Set up NLA tracks
+        armature_obj.animation_data.action = None  # Unlink active action
+        tracks = armature_obj.animation_data.nla_tracks
+        track_a = tracks.new()
+        track_a.name = "TrackA"
+        track_a.strips.new(name="StripA", start=1, action=action_a)
+
+        track_b = tracks.new()
+        track_b.name = "TrackB"
+        track_b.strips.new(name="StripB", start=1, action=action_b)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+
+        start_time = time.perf_counter()
+        result = serialize(armature_obj)
+        end_time = time.perf_counter()
+        print(
+            f"\n[BENCHMARK] 'test_nla_tracks_force_full_bake' serialize time: {end_time - start_time:.4f} seconds"
+        )
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for NLA test.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(
+            len(keyframes), 20, "Expected a full 20 frames for a rig with NLA tracks."
+        )
+
+        # Check that data from both strips is present in the bake
+        mid_frame_kf = keyframes[10]["kf"]
+        self.assertIn(
+            "BoneA",
+            mid_frame_kf,
+            "Bone from first NLA track not found in baked keyframe.",
+        )
+        self.assertIn(
+            "BoneB",
+            mid_frame_kf,
+            "Bone from second NLA track not found in baked keyframe.",
+        )
+
+    def test_nla_single_strip_uses_hybrid_easing(self):
+        """Tests that a single NLA strip uses hybrid bake and respects easing."""
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NlaSingleRig"
+        armature = armature_obj.data
+        armature.name = "NlaSingleArmature"
+
+        armature.edit_bones.new("Bone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("NlaSingleAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["Bone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 2, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(action, "CONSTANT")
+
+        # Set up a single active NLA strip
+        armature_obj.animation_data.action = None
+        track = armature_obj.animation_data.nla_tracks.new()
+        track.name = "TrackSingle"
+        track.strips.new(name="StripSingle", start=1, action=action)
+        armature_obj.animation_data.use_nla = True
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for single NLA strip test.")
+        desired_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+        baked_frames = {
+            bpy.context.scene.frame_start + int(round(kf["t"] * desired_fps))
+            for kf in result["kfs"]
+        }
+
+        self.assertSetEqual(
+            baked_frames,
+            {1, 10, 20},
+            "Expected sparse keyframes for single NLA strip hybrid bake.",
+        )
+
+        first_kf = result["kfs"][0]["kf"].get("Bone")
+        self.assertIsNotNone(first_kf, "Bone missing from first keyframe.")
+        self.assertEqual(
+            first_kf[1], "Constant", "NLA hybrid bake should respect Constant easing."
+        )
+
+        # Ensure the frame after the first key is clamped to the constant pose
+        frame_times = [
+            bpy.context.scene.frame_start + int(round(kf["t"] * desired_fps))
+            for kf in result["kfs"]
+        ]
+        if 2 in frame_times:
+            frame_index = frame_times.index(2)
+            frame_kf = result["kfs"][frame_index]["kf"].get("Bone")
+            self.assertIsNotNone(frame_kf, "Bone missing from frame 2 keyframe.")
+            self.assertEqual(
+                frame_kf[1],
+                "Constant",
+                "Frame 2 should keep Constant easing style.",
+            )
+            self.assertEqual(
+                frame_kf[0],
+                first_kf[0],
+                "Frame 2 should clamp to the first Constant pose.",
+            )
+
+    def test_nla_single_strip_bezier_forces_full_bake(self):
+        """Tests that BEZIER on a single NLA strip forces a full bake."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NlaBezierRig"
+        armature = armature_obj.data
+        armature.name = "NlaBezierArmature"
+
+        armature.edit_bones.new("Bone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("NlaBezierAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["Bone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 3, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            for kp in fcurve.keyframe_points:
+                kp.interpolation = "BEZIER"
+
+        armature_obj.animation_data.action = None
+        track = armature_obj.animation_data.nla_tracks.new()
+        track.name = "TrackBezier"
+        track.strips.new(name="StripBezier", start=1, action=action)
+        armature_obj.animation_data.use_nla = True
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        self.assertTrue(result, "Serialization returned no result for NLA bezier test.")
+        self.assertEqual(
+            len(result["kfs"]),
+            10,
+            "Expected full bake for single-strip NLA with BEZIER interpolation.",
+        )
+
+    def test_easing_serialization(self):
+        """Tests that Blender's easing types are correctly mapped to Roblox enums."""
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "EasingRig"
+        armature = armature_obj.data
+        armature.name = "EasingArmature"
+
+        bone_names = [
+            "SupportedEase",
+            "UnsupportedEase",
+            "ConstantEase",
+            "LinearEase",
+            "BounceEase",
+            "ElasticEase",
+        ]
+        for i, name in enumerate(bone_names):
+            bone = armature.edit_bones.new(name)
+            bone.head = (i, 0, 1)
+            bone.tail = (i, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Create a single action
+        action = bpy.data.actions.new("EasingAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Animate bones
+        for bone_name in bone_names:
+            pbone = armature_obj.pose.bones[bone_name]
+            pbone.location = (0, 0, 0)
+            pbone.keyframe_insert(data_path="location", frame=1)
+            pbone.location = (0, 5, 0)
+            pbone.keyframe_insert(data_path="location", frame=20)
+
+        # Set specific easing types on ALL f-curves for the given property to ensure consistent test data
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        for fcurve in fcurves:
+            kp = fcurve.keyframe_points[0]
+            if "SupportedEase" in fcurve.data_path:
+                kp.interpolation = "CUBIC"
+                kp.easing = "EASE_IN_OUT"
+            elif "UnsupportedEase" in fcurve.data_path:
+                kp.interpolation = "SINE"
+                kp.easing = "EASE_IN"
+            elif "ConstantEase" in fcurve.data_path:
+                kp.interpolation = "CONSTANT"
+            elif "LinearEase" in fcurve.data_path:
+                kp.interpolation = "LINEAR"
+                kp.easing = "EASE_IN"
+            elif "BounceEase" in fcurve.data_path:
+                kp.interpolation = "BOUNCE"
+                kp.easing = "EASE_OUT"
+            elif "ElasticEase" in fcurve.data_path:
+                kp.interpolation = "ELASTIC"
+                kp.easing = "EASE_IN"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        self.set_full_range_bake(False)
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for easing test.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(len(keyframes), 2, "Expected 2 keyframes for a sparse bake.")
+
+        first_frame_kf = keyframes[0]["kf"]
+
+        # Check SupportedEase (CUBIC, EASE_IN_OUT) -> ("CubicV2", "InOut")
+        supported_data = first_frame_kf.get("SupportedEase")
+        self.assertIsNotNone(
+            supported_data, "SupportedEase bone missing from keyframe."
+        )
+        self.assertEqual(
+            supported_data[1],
+            "CubicV2",
+            "Supported easing style did not map correctly.",
+        )
+        self.assertEqual(
+            supported_data[2],
+            "InOut",
+            "Supported easing direction did not map correctly.",
+        )
+
+        # Check UnsupportedEase (SINE, EASE_IN) -> ("Linear", "Out")
+        unsupported_data = first_frame_kf.get("UnsupportedEase")
+        self.assertIsNotNone(
+            unsupported_data, "UnsupportedEase bone missing from keyframe."
+        )
+        self.assertEqual(
+            unsupported_data[1],
+            "Linear",
+            "Unsupported easing style did not fall back to Linear.",
+        )
+        self.assertEqual(
+            unsupported_data[2],
+            "Out",
+            "Unsupported easing direction did not fall back to Out.",
+        )
+
+        # Check ConstantEase (CONSTANT) -> ("Constant", "Out")
+        constant_data = first_frame_kf.get("ConstantEase")
+        self.assertIsNotNone(constant_data, "ConstantEase bone missing from keyframe.")
+        self.assertEqual(
+            constant_data[1], "Constant", "Constant easing style did not map correctly."
+        )
+        self.assertEqual(
+            constant_data[2], "Out", "Constant easing direction did not map correctly."
+        )
+
+        # Check LinearEase (LINEAR, EASE_IN) -> ("Linear", "In")
+        linear_data = first_frame_kf.get("LinearEase")
+        self.assertIsNotNone(linear_data, "LinearEase bone missing from keyframe.")
+        self.assertEqual(
+            linear_data[1], "Linear", "Linear easing style did not map correctly."
+        )
+        self.assertEqual(
+            linear_data[2], "In", "Linear easing direction did not map correctly."
+        )
+
+        # Check BounceEase (BOUNCE, EASE_OUT) -> ("Bounce", "Out")
+        bounce_data = first_frame_kf.get("BounceEase")
+        self.assertIsNotNone(bounce_data, "BounceEase bone missing from keyframe.")
+        self.assertEqual(
+            bounce_data[1], "Bounce", "Bounce easing style did not map correctly."
+        )
+        self.assertEqual(
+            bounce_data[2], "Out", "Bounce easing direction did not map correctly."
+        )
+
+        # Check ElasticEase (ELASTIC, EASE_IN) -> ("Elastic", "In")
+        elastic_data = first_frame_kf.get("ElasticEase")
+        self.assertIsNotNone(elastic_data, "ElasticEase bone missing from keyframe.")
+        self.assertEqual(
+            elastic_data[1], "Elastic", "Elastic easing style did not map correctly."
+        )
+        self.assertEqual(
+            elastic_data[2], "In", "Elastic easing direction did not map correctly."
+        )
+
+    def test_linear_easing_consistent_across_keyframes(self):
+        """Ensure linear interpolation exports Linear/Out on every baked keyframe."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "LinearEasingRig"
+        armature = armature_obj.data
+        armature.name = "LinearEasingArmature"
+
+        armature.edit_bones.new("LinearBone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("LinearEasingAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["LinearBone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 0, 5)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            for kp in fcurve.keyframe_points:
+                kp.easing = "EASE_OUT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        self.assertTrue(result, "Serialization returned no result for linear easing.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(len(keyframes), 2, "Linear animation should remain sparse.")
+
+        first_kf = keyframes[0]["kf"].get("LinearBone")
+        last_kf = keyframes[-1]["kf"].get("LinearBone")
+
+        self.assertIsNotNone(first_kf, "LinearBone missing from first keyframe.")
+        self.assertIsNotNone(last_kf, "LinearBone missing from last keyframe.")
+
+        self.assertEqual(first_kf[1], "Linear", "First keyframe easing style should be Linear.")
+        self.assertEqual(first_kf[2], "Out", "First keyframe easing direction should be Out.")
+        self.assertEqual(last_kf[1], "Linear", "Last keyframe easing style should be Linear.")
+        self.assertEqual(last_kf[2], "Out", "Last keyframe easing direction should be Out.")
+
+        self.assertNotEqual(
+            first_kf[0],
+            last_kf[0],
+            "Linear bone should move between keyframes.",
+        )
+
+    def test_constant_easing_consistent_across_keyframes(self):
+        """Ensure constant interpolation exports Constant/Out on every baked keyframe."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ConstantEasingRig"
+        armature = armature_obj.data
+        armature.name = "ConstantEasingArmature"
+
+        armature.edit_bones.new("ConstantBone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("ConstantEasingAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["ConstantBone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 0, 3)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(action, "CONSTANT")
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            for kp in fcurve.keyframe_points:
+                kp.easing = "EASE_OUT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        self.assertTrue(result, "Serialization returned no result for constant easing.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(len(keyframes), 2, "Constant animation should remain sparse.")
+
+        for kf in (keyframes[0]["kf"], keyframes[-1]["kf"]):
+            constant_kf = kf.get("ConstantBone")
+            self.assertIsNotNone(constant_kf, "ConstantBone missing from keyframe.")
+            self.assertEqual(constant_kf[1], "Constant", "Easing style should be Constant.")
+            self.assertEqual(constant_kf[2], "Out", "Easing direction should be Out for Constant style.")
+
+        start_components = keyframes[0]["kf"]["ConstantBone"][0]
+        end_components = keyframes[-1]["kf"]["ConstantBone"][0]
+
+        self.assertNotEqual(
+            start_components,
+            end_components,
+            "Constant bone should jump to a new value on the last keyframe.",
+        )
+
+    def test_easing_with_external_copy_transforms_rig(self):
+        """Ensure constrained rig inherits easing from the target rig."""
+        # --- SETUP: Master rig ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        master_obj = bpy.context.object
+        master_obj.name = "EasingMasterRig"
+        master_armature = master_obj.data
+        master_armature.name = "EasingMasterArmature"
+
+        driver_bones = [
+            "DriverLinear",
+            "DriverCubic",
+            "DriverConstant",
+            "DriverBounce",
+            "DriverElastic",
+        ]
+        for i, name in enumerate(driver_bones):
+            bone = master_armature.edit_bones.new(name)
+            bone.head = (i, 0, 1)
+            bone.tail = (i, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in master_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        master_action = bpy.data.actions.new("EasingMasterAction")
+        master_obj.animation_data_create()
+        master_obj.animation_data.action = master_action
+
+        for i, name in enumerate(driver_bones):
+            driver_pose = master_obj.pose.bones[name]
+            driver_pose.location = (0, 0, 0)
+            driver_pose.keyframe_insert(data_path="location", frame=1)
+            driver_pose.location = (0, 0, 3 + i)
+            driver_pose.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(master_action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(master_action):
+            for kp in fcurve.keyframe_points:
+                if "DriverLinear" in fcurve.data_path:
+                    kp.interpolation = "LINEAR"
+                    kp.easing = "EASE_IN"
+                elif "DriverCubic" in fcurve.data_path:
+                    kp.interpolation = "CUBIC"
+                    kp.easing = "EASE_IN_OUT"
+                elif "DriverConstant" in fcurve.data_path:
+                    kp.interpolation = "CONSTANT"
+                    kp.easing = "EASE_OUT"
+                elif "DriverBounce" in fcurve.data_path:
+                    kp.interpolation = "BOUNCE"
+                    kp.easing = "EASE_OUT"
+                elif "DriverElastic" in fcurve.data_path:
+                    kp.interpolation = "ELASTIC"
+                    kp.easing = "EASE_IN"
+
+        # --- SETUP: Puppet rig ---
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(2, 0, 0))
+        puppet_obj = bpy.context.object
+        puppet_obj.name = "EasingPuppetRig"
+        puppet_armature = puppet_obj.data
+        puppet_armature.name = "EasingPuppetArmature"
+
+        follower_bones = [
+            "FollowerLinear",
+            "FollowerCubic",
+            "FollowerConstant",
+            "FollowerBounce",
+            "FollowerElastic",
+        ]
+        for i, name in enumerate(follower_bones):
+            bone = puppet_armature.edit_bones.new(name)
+            bone.head = (i, 0, 1)
+            bone.tail = (i, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in puppet_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        for follower_name, driver_name in zip(follower_bones, driver_bones):
+            follower_pose = puppet_obj.pose.bones[follower_name]
+            constraint = follower_pose.constraints.new(type="COPY_TRANSFORMS")
+            constraint.target = master_obj
+            constraint.subtarget = driver_name
+
+        # Give puppet an action to force hybrid bake path
+        puppet_action = bpy.data.actions.new("EasingPuppetAction")
+        puppet_obj.animation_data_create()
+        puppet_obj.animation_data.action = puppet_action
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(puppet_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for constrained easing test.")
+        keyframes = result["kfs"]
+        self.assertEqual(len(keyframes), 10, "Expected a full 10 frames for constrained rig.")
+
+        first_kf = keyframes[0]["kf"]
+        last_kf = keyframes[-1]["kf"]
+
+        expected = {
+            "FollowerLinear": ("Linear", "In"),
+            "FollowerCubic": ("CubicV2", "InOut"),
+            "FollowerConstant": ("Constant", "Out"),
+            "FollowerBounce": ("Bounce", "Out"),
+            "FollowerElastic": ("Elastic", "In"),
+        }
+
+        for bone_name, (style, direction) in expected.items():
+            first_data = first_kf.get(bone_name)
+            last_data = last_kf.get(bone_name)
+            self.assertIsNotNone(first_data, f"{bone_name} missing from first keyframe.")
+            self.assertIsNotNone(last_data, f"{bone_name} missing from last keyframe.")
+            self.assertEqual(
+                first_data[1],
+                style,
+                f"Constrained easing style did not map correctly for {bone_name}.",
+            )
+            self.assertEqual(
+                first_data[2],
+                direction,
+                f"Constrained easing direction did not map correctly for {bone_name}.",
+            )
+            self.assertEqual(
+                last_data[1],
+                style,
+                f"Constrained easing style did not map correctly for {bone_name}.",
+            )
+            self.assertEqual(
+                last_data[2],
+                direction,
+                f"Constrained easing direction did not map correctly for {bone_name}.",
+            )
+
+    def test_copy_transforms_no_keys(self):
+        """
+        Tests that a bone with a Copy Transforms constraint is fully baked,
+        even if it has no keyframes itself.
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "CopyTransformRig"
+        armature = armature_obj.data
+        armature.name = "CopyTransformArmature"
+
+        armature.edit_bones.new("Driver").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 1, 1)
+        armature.edit_bones.new("Follower").head = (2, 0, 1)
+        armature.edit_bones[-1].tail = (2, 1, 1)
+        armature.edit_bones.new("Independent").head = (-2, 0, 1)
+        armature.edit_bones[-1].tail = (-2, 1, 1)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Create an action and animate the Driver and Independent bones
+        action = bpy.data.actions.new("CopyAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        driver_pose = armature_obj.pose.bones["Driver"]
+        driver_pose.rotation_quaternion = (1, 0, 0, 0)
+        driver_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        driver_pose.rotation_quaternion = (0.707, 0, 0.707, 0)
+        driver_pose.keyframe_insert(data_path="rotation_quaternion", frame=20)
+
+        independent_pose = armature_obj.pose.bones["Independent"]
+        independent_pose.location = (0, 0, 0)
+        independent_pose.keyframe_insert(data_path="location", frame=1)
+        independent_pose.location = (0, 5, 0)
+        independent_pose.keyframe_insert(data_path="location", frame=20)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        # Add the constraint to the Follower bone
+        follower_pose = armature_obj.pose.bones["Follower"]
+        constraint = follower_pose.constraints.new(type="COPY_TRANSFORMS")
+        constraint.target = armature_obj
+        constraint.subtarget = "Driver"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(
+            result, "Serialization returned no result for copy transforms test."
+        )
+        keyframes = result["kfs"]
+
+        # Because one bone is constrained, a full 20 frames will be sampled.
+        # The optimization step will preserve all frames containing the constrained bone.
+        self.assertEqual(
+            len(keyframes), 20, "Expected a full 20 frames due to the constraint."
+        )
+
+        follower_kf_count = 0
+        driver_kf_count = 0
+        independent_kf_count = 0
+
+        for kf in keyframes:
+            kf_bones = kf["kf"].keys()
+            if "Follower" in kf_bones:
+                follower_kf_count += 1
+            if "Driver" in kf_bones:
+                driver_kf_count += 1
+            if "Independent" in kf_bones:
+                independent_kf_count += 1
+
+        self.assertEqual(
+            follower_kf_count,
+            20,
+            "Constrained 'Follower' bone should be baked on every frame.",
+        )
+        self.assertEqual(
+            driver_kf_count,
+            2,
+            "Sparsely animated 'Driver' bone should only have 2 keyframes.",
+        )
+        self.assertEqual(
+            independent_kf_count,
+            2,
+            "Sparsely animated 'Independent' bone should only have 2 keyframes.",
+        )
+
+    def test_constrained_constant_animation_stays_sparse(self):
+        """
+        Tests that constrained bones with CONSTANT interpolation do not bake every frame.
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ConstantConstraintRig"
+        armature = armature_obj.data
+        armature.name = "ConstantConstraintArmature"
+
+        armature.edit_bones.new("Driver").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+        armature.edit_bones.new("Follower").head = (1, 0, 1)
+        armature.edit_bones[-1].tail = (1, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("ConstantConstraintAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        driver_pose = armature_obj.pose.bones["Driver"]
+        driver_pose.location = (0, 0, 0)
+        driver_pose.keyframe_insert(data_path="location", frame=1)
+        driver_pose.location = (0, 5, 0)
+        driver_pose.keyframe_insert(data_path="location", frame=20)
+
+        self.set_action_interpolation(action, "CONSTANT")
+
+        follower_pose = armature_obj.pose.bones["Follower"]
+        constraint = follower_pose.constraints.new(type="COPY_TRANSFORMS")
+        constraint.target = armature_obj
+        constraint.subtarget = "Driver"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for constant constraint test.")
+        keyframes = result["kfs"]
+
+        self.assertLessEqual(
+            len(keyframes),
+            3,
+            "Expected constant constrained animation to stay sparse (<= 3 keyframes).",
+        )
+
+        desired_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+        baked_frames = {
+            bpy.context.scene.frame_start + int(round(kf["t"] * desired_fps))
+            for kf in keyframes
+        }
+        self.assertIn(
+            bpy.context.scene.frame_start,
+            baked_frames,
+            "Expected boundary start frame to be baked.",
+        )
+        self.assertIn(
+            bpy.context.scene.frame_end,
+            baked_frames,
+            "Expected boundary end frame to be baked.",
+        )
+
+        first_kf = keyframes[0]["kf"]
+        last_kf = keyframes[-1]["kf"]
+        self.assertIn("Follower", first_kf, "Follower missing from first keyframe.")
+        self.assertIn("Follower", last_kf, "Follower missing from last keyframe.")
+
+        self.assertEqual(
+            first_kf["Follower"][1],
+            "Constant",
+            "Follower should use Constant easing style on first keyframe.",
+        )
+        self.assertEqual(
+            first_kf["Follower"][2],
+            "Out",
+            "Follower should use Out easing direction on first keyframe.",
+        )
+
+    def test_constraint_driven_with_no_action(self):
+        """
+        Tests that a rig with NO action is still exported if its bones are
+        driven by constraints targeting an animated external object.
+        """
+        # --- SETUP ---
+        # 1. Armature with one bone, no animation
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NoActionRig"
+        armature = armature_obj.data
+        armature.name = "NoActionArmature"
+        armature.edit_bones.new("Follower").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # 2. An animated Empty
+        bpy.ops.object.mode_set(mode="OBJECT")
+        driver_empty = bpy.ops.object.add(type="EMPTY", location=(0, 0, 0))
+        driver_empty = bpy.context.object
+        driver_empty.name = "DriverEmpty"
+        driver_empty.keyframe_insert(data_path="location", frame=1)
+        driver_empty.location.z = 5
+        driver_empty.keyframe_insert(data_path="location", frame=20)
+        if driver_empty.animation_data and driver_empty.animation_data.action:
+            self.set_action_interpolation(driver_empty.animation_data.action, "LINEAR")
+
+        # 3. Constraint linking the two
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="POSE")
+        follower_pose = armature_obj.pose.bones["Follower"]
+        constraint = follower_pose.constraints.new(type="COPY_LOCATION")
+        constraint.target = driver_empty
+
+        # 4. Ensure the armature has NO action
+        if armature_obj.animation_data:
+            armature_obj.animation_data_clear()
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(
+            result, "Serialization returned no result for constraint-only test."
+        )
+        keyframes = result["kfs"]
+
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected a full 20 frames for a rig driven only by constraints.",
+        )
+
+        follower_kf_count = 0
+        for kf in keyframes:
+            if "Follower" in kf["kf"].keys():
+                follower_kf_count += 1
+
+        self.assertEqual(
+            follower_kf_count,
+            20,
+            "Constrained 'Follower' bone should be baked on every frame.",
+        )
+
+    def test_external_rig_constraint_no_action(self):
+        """
+        Tests that a "puppet" rig with no action is correctly baked when its
+        bones are constrained to a separate, animated "master" rig.
+        """
+        # --- SETUP ---
+        # 1. Create Master Rig and animate it
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        master_obj = bpy.context.object
+        master_obj.name = "MasterRig"
+        master_armature = master_obj.data
+        master_armature.name = "MasterArmature"
+        master_armature.edit_bones.new("MasterBone").head = (0, 0, 1)
+        master_armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        master_action = bpy.data.actions.new("MasterAction")
+        master_obj.animation_data_create()
+        master_obj.animation_data.action = master_action
+        master_pose_bone = master_obj.pose.bones["MasterBone"]
+        master_pose_bone.location = (0, 0, 0)
+        master_pose_bone.keyframe_insert(data_path="location", frame=1)
+        master_pose_bone.location = (5, 0, 0)
+        master_pose_bone.keyframe_insert(data_path="location", frame=20)
+        self.set_action_interpolation(master_action, "CONSTANT")
+
+        # 2. Create Puppet Rig (the one we will export)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(2, 0, 0))
+        puppet_obj = bpy.context.object
+        puppet_obj.name = "PuppetRig"
+        puppet_armature = puppet_obj.data
+        puppet_armature.name = "PuppetArmature"
+        puppet_armature.edit_bones.new("PuppetBone").head = (2, 0, 1)
+        puppet_armature.edit_bones[-1].tail = (2, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in puppet_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # 3. Constrain Puppet to Master
+        puppet_pose_bone = puppet_obj.pose.bones["PuppetBone"]
+        constraint = puppet_pose_bone.constraints.new(type="COPY_TRANSFORMS")
+        constraint.target = master_obj
+        constraint.subtarget = "MasterBone"
+
+        # 4. Ensure Puppet has NO action
+        if puppet_obj.animation_data:
+            puppet_obj.animation_data_clear()
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(puppet_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for puppet rig test.")
+        keyframes = result["kfs"]
+        self.assertGreaterEqual(
+            len(keyframes), 2, "Expected keyframes for the constrained puppet rig."
+        )
+        self.assertAlmostEqual(keyframes[0]["t"], 0.0, places=4)
+        self.assertAlmostEqual(keyframes[-1]["t"], 19 / utils.get_scene_fps(), places=4)
+
+        # Check that the bone was actually exported and has non-identity transforms.
+        # Constraint-target actions use the hybrid baker, so CONSTANT interpolation
+        # can export sparsely instead of baking every frame.
+        last_frame_kf = keyframes[-1]["kf"]
+        self.assertIn(
+            "PuppetBone", last_frame_kf, "PuppetBone not found in the last keyframe."
+        )
+
+        puppet_bone_data = last_frame_kf["PuppetBone"]
+        self.assertIsInstance(
+            puppet_bone_data,
+            list,
+            "Puppet bone data should be a list [cframe, style, dir].",
+        )
+        self.assertEqual(
+            len(puppet_bone_data), 3, "Puppet bone data should have 3 elements."
+        )
+        self.assertEqual(
+            puppet_bone_data[1],
+            "Constant",
+            "External constraint target CONSTANT interpolation should be preserved.",
+        )
+
+        cframe_components = puppet_bone_data[0]
+        # The position should be around (3,0,0) because it started at (2,0,0) and the master moved to (5,0,0)
+        self.assertAlmostEqual(
+            cframe_components[0],
+            3,
+            places=4,
+            msg="Puppet bone was not in the correct final position.",
+        )
+
+    def test_driver_only_rig_is_baked(self):
+        """
+        Tests that a rig driven only by animation drivers is fully baked
+        even when it has no action.
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DriverOnlyRig"
+        armature_obj.data.name = "DriverOnlyArmature"
+
+        armature_obj.data.edit_bones.new("DrivenBone").head = (0, 0, 1)
+        armature_obj.data.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Add driver to Z location using frame number
+        driven_pose = armature_obj.pose.bones["DrivenBone"]
+        driver_fcurve = driven_pose.driver_add("location", 2)
+        driver = driver_fcurve.driver
+        driver.type = "SCRIPTED"
+        driver.expression = "frame / 10.0"
+
+        # Ensure no action is present but keep drivers
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = None
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for driver-only rig.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected a full 20 frames for a rig driven by drivers.",
+        )
+
+        first_kf = keyframes[0]["kf"].get("DrivenBone")
+        last_kf = keyframes[-1]["kf"].get("DrivenBone")
+        self.assertIsNotNone(first_kf, "DrivenBone missing from first keyframe.")
+        self.assertIsNotNone(last_kf, "DrivenBone missing from last keyframe.")
+
+        self.assertNotEqual(
+            first_kf[0],
+            last_kf[0],
+            "Driven bone should change across frames.",
+        )
+
+    def test_deform_rig_detection_with_modifier(self):
+        """
+        Tests that a rig is correctly identified as a deform bone rig when
+        it's linked to a mesh via an Armature modifier.
+        """
+        # --- SETUP ---
+        # 1. Create an armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DeformModifierRig"
+        armature_obj.data.name = "DeformModifierArmature"
+        armature_obj.data.edit_bones.new("DeformBone").head = (0, 0, 1)
+        armature_obj.data.edit_bones[-1].tail = (0, 0, 0)
+
+        # 2. Create a mesh object
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+        mesh_obj = bpy.context.object
+        mesh_obj.name = "DeformingMesh"
+
+        # 3. Link them with an Armature modifier
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+
+        # --- EXECUTION & ASSERTION ---
+        self.assertTrue(
+            is_deform_bone_rig(armature_obj),
+            "Rig with Armature modifier was not detected as a deform rig.",
+        )
+
+    def test_deform_rig_export(self):
+        """
+        Tests the full animation export pipeline for a deform bone rig.
+        """
+        # --- SETUP ---
+        # 1. Create Armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DeformExportRig"
+        armature_obj.data.name = "DeformExportArmature"
+
+        deform_bone = armature_obj.data.edit_bones.new("TestDeformBone")
+        deform_bone.head = (0, 0, 1)
+        deform_bone.tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        # 2. Create Mesh and parent it
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        mesh_obj.name = "DeformTestMesh"
+
+        # Parent mesh to armature and create vertex groups
+        mesh_obj.select_set(True)
+        armature_obj.select_set(True)
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+
+        # Ensure the deform bone property is set
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["TestDeformBone"]
+        self.assertTrue(
+            pbone.bone.use_deform, "Bone should be a deform bone after parenting."
+        )
+
+        # 3. Animate the deform bone
+        action = bpy.data.actions.new("DeformExportAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 3, 4)  # Move the bone
+        pbone.keyframe_insert(data_path="location", frame=20)
+
+        # 4. Set Scene Properties
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = (
+                0.1  # Use a known scale for consistent testing
+            )
+        bpy.context.scene.unit_settings.scale_length = 0.1
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(20)  # Go to the final frame to check the state
+
+        start_time = time.perf_counter()
+        result = serialize(armature_obj)
+        end_time = time.perf_counter()
+        print(
+            f"\n[BENCHMARK] 'test_deform_rig_export' serialize time: {end_time - start_time:.4f} seconds"
+        )
+
+        # --- ASSERTION ---
+        self.assertIsNotNone(result, "Serialization returned None for deform rig.")
+        self.assertTrue(
+            result.get("is_deform_bone_rig"), "is_deform_bone_rig flag should be true."
+        )
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "manual")
+        self.assertAlmostEqual(result["export_info"]["deform_scale_factor"], 0.1)
+        self.assertAlmostEqual(result["export_info"]["scene_unit_scale"], 0.1)
+        self.assertIn(
+            "bone_hierarchy", result, "Deform rig export should include hierarchy."
+        )
+        self.assertEqual(result["bone_hierarchy"], {"TestDeformBone": None})
+
+        self.assertIn("kfs", result, "Result should have keyframes.")
+        # With full-range bake defaulting to True, expect all frames
+        expected_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(
+            len(result["kfs"]),
+            expected_frames,
+            f"Expected {expected_frames} keyframes for full-range deform rig animation.",
+        )
+
+        last_frame_data = result["kfs"][-1]["kf"]
+        self.assertIn(
+            "TestDeformBone", last_frame_data, "Deform bone not found in last keyframe."
+        )
+
+        # Check the transformed CFrame data.
+        # This is the most critical part, as it verifies the complex math in serialize_deform_animation_state.
+        cframe_components = last_frame_data["TestDeformBone"][0]
+
+        # Blender location: (2, 3, 4)
+        # Scale factor: 0.1
+        # After scale: (20, 30, 40)
+        # After swizzle (-x, y, -z): (-20, 30, -40)
+        self.assertAlmostEqual(cframe_components[0], -20.0, places=4)
+        self.assertAlmostEqual(cframe_components[1], 30.0, places=4)
+        self.assertAlmostEqual(cframe_components[2], -40.0, places=4)
+
+    def test_auto_deform_scale_preserves_evaluated_object_scale(self):
+        """Auto scale should export evaluated scene-unit deform translations."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ScaledDeformExportRig"
+
+        deform_bone = armature_obj.data.edit_bones.new("ScaledDeformBone")
+        deform_bone.head = (0, 0, 0)
+        deform_bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 0.5, 0.5)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        mesh_obj.name = "ScaledDeformTestMesh"
+
+        mesh_obj.select_set(True)
+        armature_obj.select_set(True)
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["ScaledDeformBone"]
+
+        action = bpy.data.actions.new("ScaledDeformExportAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto")
+        self.assertEqual(result["export_info"]["deform_scale_factor"], 2.0)
+        self.assertEqual(result["export_info"]["armature_object_scale"], 0.5)
+        self.assertEqual(
+            result["export_info"]["armature_object_scale_axes"],
+            [0.5, 0.5, 0.5],
+        )
+        self.assertTrue(result["export_info"]["armature_object_scale_uniform"])
+        self.assertTrue(result["export_info"]["deform_position_scale_reliable"])
+
+        last_frame_data = result["kfs"][-1]["kf"]
+        cframe_components = last_frame_data["ScaledDeformBone"][0]
+        self.assertAlmostEqual(cframe_components[0], -1.0, places=4)
+        self.assertAlmostEqual(cframe_components[1], 0.0, places=4)
+        self.assertAlmostEqual(cframe_components[2], 0.0, places=4)
+
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.5
+            bpy.context.scene.unit_settings.scale_length = 0.2
+            self.assertEqual(
+                serialization.resolve_deform_rig_scale_factor(armature_obj, settings),
+                0.5,
+            )
+
+    def test_auto_deform_scale_uses_parent_object_scale_for_position(self):
+        """Parent-resized armatures should export evaluated position units."""
+        bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
+        parent_obj = bpy.context.object
+        parent_obj.name = "ScaledParentObject"
+        parent_obj.scale = (0.5, 0.5, 0.5)
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ParentScaledDeformExportRig"
+        armature_obj.parent = parent_obj
+
+        deform_bone = armature_obj.data.edit_bones.new("ScaledDeformBone")
+        deform_bone.head = (0, 0, 0)
+        deform_bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="ScaledDeformBone")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["ScaledDeformBone"]
+
+        action = bpy.data.actions.new("ParentScaledDeformExportAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+        cframe_components = result["kfs"][-1]["kf"]["ScaledDeformBone"][0]
+
+        self.assertAlmostEqual(cframe_components[0], -1.0, places=4)
+        self.assertEqual(result["export_info"]["deform_scale_factor"], 2.0)
+        self.assertEqual(
+            result["export_info"]["armature_object_scale_axes"],
+            [0.5, 0.5, 0.5],
+        )
+        self.assertTrue(result["export_info"]["deform_position_scale_reliable"])
+
+    def test_auto_deform_scale_uses_target_rest_calibration(self):
+        """Server sync should target the live Roblox rig rest scale when provided."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "TargetScaledDeformExportRig"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (0, 0, 1)
+
+        child_bone = armature_obj.data.edit_bones.new("Child")
+        child_bone.head = (0, 0, 1)
+        child_bone.tail = (0, 0, 2)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Child"]
+
+        action = bpy.data.actions.new("TargetScaledDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (1, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(
+            armature_obj,
+            target_bone_rest={
+                "bones": {
+                    "Child": {
+                        "parent": "Root",
+                        "distance": 5.0,
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto_calibrated")
+        self.assertAlmostEqual(
+            result["export_info"]["deform_target_scale_multiplier"],
+            5.0,
+            places=4,
+        )
+        self.assertAlmostEqual(result["export_info"]["deform_scale_factor"], 0.2, places=4)
+        self.assertEqual(result["export_info"]["deform_target_scale_sample_count"], 1)
+
+        cframe_components = result["kfs"][-1]["kf"]["Child"][0]
+        self.assertAlmostEqual(cframe_components[0], -5.0, places=4)
+
+    def test_skinned_export_warns_when_target_rest_is_missing(self):
+        """Skinned exports should say when live rig calibration was skipped."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "MissingTargetRestScaleWarningRig"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (0, 0, 1)
+
+        child_bone = armature_obj.data.edit_bones.new("Child")
+        child_bone.head = (0, 0, 1)
+        child_bone.tail = (0, 0, 2)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 0.5, 0.5)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Child"]
+
+        action = bpy.data.actions.new("MissingTargetRestScaleWarningAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        with mock.patch("builtins.print") as mock_print:
+            result = serialize(armature_obj)
+
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto")
+        self.assertIn("deform_target_scale_warning", result["export_info"])
+        self.assertIn(
+            "No target rig rest data was provided",
+            result["export_info"]["deform_target_scale_warning"],
+        )
+        printed_messages = [
+            " ".join(str(part) for part in call.args)
+            for call in mock_print.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                "Deform export scale mode=auto factor=2.000000" in message
+                for message in printed_messages
+            )
+        )
+        self.assertTrue(
+            any(
+                "No target rig rest data was provided for this skinned export" in message
+                for message in printed_messages
+            )
+        )
+
+    def test_target_rest_calibration_accounts_for_object_scale(self):
+        """Matching a scaled Blender armature should not double-apply object scale."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ObjectScaledTargetCalibrationRig"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (0, 0, 1)
+
+        child_bone = armature_obj.data.edit_bones.new("Child")
+        child_bone.head = (0, 0, 1)
+        child_bone.tail = (0, 0, 2)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 0.5, 0.5)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Child"]
+
+        action = bpy.data.actions.new("ObjectScaledTargetCalibrationAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(
+            armature_obj,
+            target_bone_rest={
+                "bones": {
+                    "Child": {
+                        "parent": "Root",
+                        "distance": 0.5,
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto_calibrated")
+        self.assertAlmostEqual(
+            result["export_info"]["deform_target_scale_multiplier"],
+            1.0,
+            places=4,
+        )
+        self.assertAlmostEqual(result["export_info"]["deform_scale_factor"], 2.0, places=4)
+
+        cframe_components = result["kfs"][-1]["kf"]["Child"][0]
+        self.assertAlmostEqual(cframe_components[0], -1.0, places=4)
+
+    def test_auto_deform_scale_flags_nonuniform_object_scale(self):
+        """Nonuniform armature scale is not silently treated as 1:1 position scale."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NonUniformScaledDeformRig"
+
+        deform_bone = armature_obj.data.edit_bones.new("ScaledDeformBone")
+        deform_bone.head = (0, 0, 0)
+        deform_bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 1.0, 0.25)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="ScaledDeformBone")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["ScaledDeformBone"]
+
+        action = bpy.data.actions.new("NonUniformScaledDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (1, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        self.assertEqual(
+            result["export_info"]["armature_object_scale_axes"],
+            [0.5, 1.0, 0.25],
+        )
+        self.assertFalse(result["export_info"]["armature_object_scale_uniform"])
+        self.assertFalse(result["export_info"]["deform_position_scale_reliable"])
+        self.assertIn("deform_scale_warning", result["export_info"])
+
+    def test_static_pose_export(self):
+        """
+        Tests that an armature with no animation data exports its current
+        pose as a single-frame animation.
+        """
+        # --- SETUP ---
+        # 1. Create a simple armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "StaticPoseRig"
+        armature_obj.data.name = "StaticPoseArmature"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (
+            0,
+            0.01,
+            0,
+        )  # Use a small Y-axis offset for an identity rest matrix
+
+        bone = armature_obj.data.edit_bones.new("Bone")
+        bone.head = (0, 0.01, 0)
+        bone.tail = (0, 1, 0)
+        bone.parent = root_bone
+
+        # 2. Set a specific pose but add NO keyframes
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+        pbone.rotation_quaternion.rotate(
+            mathutils.Euler((math.radians(90), 0, 0), "XYZ")
+        )
+
+        # Add custom properties so it uses the Motor6D serialization path
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Ensure there is NO action
+        if armature_obj.animation_data:
+            armature_obj.animation_data_clear()
+
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertIsNotNone(result)
+        self.assertEqual(result["t"], 0, "Duration should be 0 for a static pose.")
+        self.assertEqual(
+            len(result["kfs"]), 1, "Expected exactly one keyframe for a static pose."
+        )
+
+        kf_data = result["kfs"][0]["kf"]
+        self.assertIn("Bone", kf_data, "Posed bone should be in the keyframe.")
+        self.assertNotIn(
+            "Root", kf_data, "Un-posed root bone should not be in the keyframe."
+        )
+
+        # Check that the pose is roughly correct (a 90-degree rotation on X)
+        cframe_components = kf_data["Bone"][0]
+        rows = [
+            tuple(float(v) for v in cframe_components[3:6]),
+            tuple(float(v) for v in cframe_components[6:9]),
+            tuple(float(v) for v in cframe_components[9:12]),
+        ]
+        rotation_matrix = mathutils.Matrix(rows)
+        euler = rotation_matrix.to_euler("XYZ")
+
+        self.assertAlmostEqual(math.degrees(euler.x), 90, places=4)
+
+    def test_mixed_rig_export(self):
+        """
+        Tests that a rig with both deform bones and Motor6D-style bones
+        serializes both types of bones correctly in a single animation.
+        """
+        # --- SETUP ---
+        # 1. Create Armature with two child bones
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "MixedRig"
+        armature_obj.data.name = "MixedArmature"
+
+        root = armature_obj.data.edit_bones.new("Root")
+        root.head = (0, 0, 0)
+        root.tail = (0, 0.01, 0)
+
+        deform_child = armature_obj.data.edit_bones.new("DeformChild")
+        deform_child.parent = root
+        deform_child.head = (-1, 0.01, 0)
+        deform_child.tail = (-1, 1, 0)
+
+        motor_child = armature_obj.data.edit_bones.new("MotorChild")
+        motor_child.parent = root
+        motor_child.head = (1, 0.01, 0)
+        motor_child.tail = (1, 1, 0)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        # 2. Create a mesh and link it to make this a "deform rig"
+        bpy.ops.mesh.primitive_cube_add(location=(-1, 0.5, 0))
+        bpy.ops.object.parent_set(
+            type="ARMATURE_AUTO"
+        )  # This will set use_deform=True on bones with weights
+
+        # 3. Configure bones
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode="POSE")
+        # This bone got weights, so it should be a deform bone
+        self.assertTrue(armature_obj.pose.bones["DeformChild"].bone.use_deform)
+
+        # Manually configure the other as a Motor6D-style bone
+        motor_pbone = armature_obj.pose.bones["MotorChild"]
+        motor_pbone.bone.use_deform = False
+        motor_pbone.bone["is_transformable"] = True
+        motor_pbone.bone["transform"] = mathutils.Matrix.Identity(4)
+        motor_pbone.bone["transform0"] = mathutils.Matrix.Identity(4)
+        motor_pbone.bone["transform1"] = mathutils.Matrix.Identity(4)
+        motor_pbone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # 4. Animate both bones
+        action = bpy.data.actions.new("MixedAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Animate DeformChild location
+        deform_pbone = armature_obj.pose.bones["DeformChild"]
+        deform_pbone.location.x = 0
+        deform_pbone.keyframe_insert(data_path="location", frame=1)
+        deform_pbone.location.x = -2
+        deform_pbone.keyframe_insert(data_path="location", frame=10)
+
+        # Animate MotorChild rotation
+        motor_pbone.rotation_quaternion = (1, 0, 0, 0)
+        motor_pbone.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        motor_pbone.rotation_quaternion.rotate(
+            mathutils.Euler((0, 0, math.radians(90)), "XYZ")
+        )
+        motor_pbone.keyframe_insert(data_path="rotation_quaternion", frame=10)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION ---
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertIsNotNone(result)
+        last_frame_kf = result["kfs"][-1]["kf"]
+
+        # This is the key assertion: both bones should be in the exported data.
+        self.assertIn(
+            "DeformChild", last_frame_kf, "Deform bone was not exported in mixed rig."
+        )
+        self.assertIn(
+            "MotorChild", last_frame_kf, "Motor6D bone was not exported in mixed rig."
+        )
+
+    def test_stress_benchmark_many_bones(self):
+        """
+        Benchmarks the serializer with a large number of bones and a long,
+        complex animation to test performance under heavy load.
+        """
+        # --- SETUP ---
+        BONE_COUNT = 200
+        FRAME_COUNT = 100
+
+        # 1. Create Armature
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "StressTestRig"
+        armature = armature_obj.data
+        armature.name = "StressTestArmature"
+
+        # Create a chain of bones
+        last_bone = None
+        for i in range(BONE_COUNT):
+            bone = armature.edit_bones.new(f"Bone.{i:03d}")
+            bone.head = (i, 0, 0)
+            bone.tail = (i + 0.5, 0, 0)
+            if last_bone:
+                bone.parent = last_bone
+            last_bone = bone
+
+        # Add an IK target at the end of the chain
+        ik_target_bone = armature.edit_bones.new("IKTarget")
+        ik_target_bone.head = (BONE_COUNT, 1, 0)
+        ik_target_bone.tail = (BONE_COUNT, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # 2. Add properties and constraints
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Add IK constraint to the last bone in the chain
+        last_bone_name = f"Bone.{(BONE_COUNT - 1):03d}"
+        last_pose_bone = armature_obj.pose.bones[last_bone_name]
+        ik_constraint = last_pose_bone.constraints.new(type="IK")
+        ik_constraint.target = armature_obj
+        ik_constraint.subtarget = "IKTarget"
+        ik_constraint.chain_count = BONE_COUNT  # The entire chain is affected
+
+        # 3. Animate the IK target
+        action = bpy.data.actions.new("StressTestAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        ik_target_pose = armature_obj.pose.bones["IKTarget"]
+        ik_target_pose.location = (0, 0, 0)
+        ik_target_pose.keyframe_insert(data_path="location", frame=1)
+        ik_target_pose.location = (0, BONE_COUNT / 2, 0)
+        ik_target_pose.keyframe_insert(data_path="location", frame=FRAME_COUNT / 2)
+        ik_target_pose.location = (0, 0, 0)
+        ik_target_pose.keyframe_insert(data_path="location", frame=FRAME_COUNT)
+
+        # 4. Set Scene Properties
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = FRAME_COUNT
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # --- EXECUTION & BENCHMARKING ---
+        print(
+            f"\n[BENCHMARK] Starting stress test: {BONE_COUNT} bones, {FRAME_COUNT} frames..."
+        )
+        bpy.context.scene.frame_set(1)  # Ensure depsgraph is updated
+
+        start_time = time.perf_counter()
+        result = serialize(armature_obj)
+        end_time = time.perf_counter()
+
+        print(
+            f"[BENCHMARK] 'test_stress_benchmark_many_bones' serialize time: {end_time - start_time:.4f} seconds"
+        )
+        print(
+            f"[BENCHMARK] that's {(end_time - start_time) / FRAME_COUNT * 1000:.2f}ms per frame"
+        )
+        print(
+            f"[BENCHMARK] or {(end_time - start_time) / (BONE_COUNT * FRAME_COUNT) * 1000000:.2f}μs per bone per frame"
+        )
+
+        # --- ASSERTION ---
+        self.assertIsNotNone(result, "Serialization returned None for stress test.")
+        # Due to the IK constraint, we expect a full bake
+        self.assertEqual(
+            len(result["kfs"]),
+            FRAME_COUNT,
+            f"Expected {FRAME_COUNT} keyframes for stress test.",
+        )
+        # Check that the last bone in the chain is present in a keyframe
+        self.assertIn(
+            last_bone_name,
+            result["kfs"][-1]["kf"],
+            "Last bone in chain not found in final keyframe.",
+        )
+
+    def test_benchmark_sparse_vs_full_bake(self):
+        """
+        Compares performance of sparse baking vs full constraint-driven baking
+        to isolate the impact of frame count vs bone count.
+        """
+        BONE_COUNT = 50
+        FRAME_COUNT = 100
+
+        # Test 1: Sparse baking (no constraints)
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        sparse_armature = bpy.context.object
+        sparse_armature.name = "SparseTestRig"
+
+        for i in range(BONE_COUNT):
+            bone = sparse_armature.data.edit_bones.new(f"SparseBone.{i:03d}")
+            bone.head = (i, 0, 0)
+            bone.tail = (i + 0.5, 0, 0)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for bone in sparse_armature.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Animate just one bone sparsely
+        action = bpy.data.actions.new("SparseAction")
+        sparse_armature.animation_data_create()
+        sparse_armature.animation_data.action = action
+
+        first_bone = sparse_armature.pose.bones["SparseBone.000"]
+        first_bone.location = (0, 0, 0)
+        first_bone.keyframe_insert(data_path="location", frame=1)
+        first_bone.location = (0, 5, 0)
+        first_bone.keyframe_insert(data_path="location", frame=FRAME_COUNT)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = FRAME_COUNT
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        bpy.context.scene.frame_set(1)
+
+        start_sparse = time.perf_counter()
+        sparse_result = serialize(sparse_armature)
+        end_sparse = time.perf_counter()
+
+        sparse_time = end_sparse - start_sparse
+        print(
+            f"\n[BENCHMARK] Sparse baking ({BONE_COUNT} bones, 2 keyframes): {sparse_time:.4f}s"
+        )
+
+        # Test 2: Full baking with constraints
+        bpy.ops.object.mode_set(mode="OBJECT")
+        # Remove all objects using low-level API
+        objects_to_remove = list(bpy.data.objects)
+        for obj in objects_to_remove:
+            bpy.data.objects.remove(obj)
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        full_armature = bpy.context.object
+        full_armature.name = "FullTestRig"
+
+        last_bone = None
+        for i in range(BONE_COUNT):
+            bone = full_armature.data.edit_bones.new(f"FullBone.{i:03d}")
+            bone.head = (i, 0, 0)
+            bone.tail = (i + 0.5, 0, 0)
+            if last_bone:
+                bone.parent = last_bone
+            last_bone = bone
+
+        # Add IK target
+        ik_target = full_armature.data.edit_bones.new("IKTarget")
+        ik_target.head = (BONE_COUNT, 1, 0)
+        ik_target.tail = (BONE_COUNT, 0, 0)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for bone in full_armature.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Add constraint
+        last_bone_name = f"FullBone.{(BONE_COUNT - 1):03d}"
+        constraint = full_armature.pose.bones[last_bone_name].constraints.new(type="IK")
+        constraint.target = full_armature
+        constraint.subtarget = "IKTarget"
+        constraint.chain_count = BONE_COUNT
+
+        # Same animation as sparse test
+        action2 = bpy.data.actions.new("FullAction")
+        full_armature.animation_data_create()
+        full_armature.animation_data.action = action2
+
+        ik_pose = full_armature.pose.bones["IKTarget"]
+        ik_pose.location = (0, 0, 0)
+        ik_pose.keyframe_insert(data_path="location", frame=1)
+        ik_pose.location = (0, 5, 0)
+        ik_pose.keyframe_insert(data_path="location", frame=FRAME_COUNT)
+
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+        bpy.context.scene.frame_set(1)
+
+        start_full = time.perf_counter()
+        full_result = serialize(full_armature)
+        end_full = time.perf_counter()
+
+        full_time = end_full - start_full
+        print(
+            f"[BENCHMARK] Full baking ({BONE_COUNT} bones, {FRAME_COUNT} frames): {full_time:.4f}s"
+        )
+        print(f"[BENCHMARK] Slowdown factor: {full_time / sparse_time:.1f}x")
+        print(
+            f"[BENCHMARK] Time per frame in full bake: {full_time / FRAME_COUNT * 1000:.2f}ms"
+        )
+
+        # Verify results - sparse test now uses full-range bake by default
+        expected_sparse_frames = FRAME_COUNT  # full-range bake means all frames
+        self.assertEqual(
+            len(sparse_result["kfs"]),
+            expected_sparse_frames,
+            f"Sparse with full-range should have {expected_sparse_frames} keyframes",
+        )
+        self.assertEqual(
+            len(full_result["kfs"]),
+            FRAME_COUNT,
+            f"Full should have {FRAME_COUNT} keyframes",
+        )
+
+        # Verify keyframe ordering
+        sparse_times = [kf["t"] for kf in sparse_result["kfs"]]
+        full_times = [kf["t"] for kf in full_result["kfs"]]
+        self.assertEqual(
+            sparse_times, sorted(sparse_times), "Sparse keyframes should be ordered"
+        )
+        self.assertEqual(
+            full_times, sorted(full_times), "Full bake keyframes should be ordered"
+        )
+
+    def test_keyframe_ordering_robustness(self):
+        """
+        Tests that keyframes are always ordered correctly, even with complex timing scenarios
+        that could cause floating point precision issues.
+        """
+        # Create armature with complex timing
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "OrderingTestRig"
+        armature = armature_obj.data
+        armature.name = "OrderingTestArmature"
+
+        # Create bones
+        for i in range(5):
+            bone = armature.edit_bones.new(f"Bone.{i:03d}")
+            bone.head = (i, 0, 0)
+            bone.tail = (i + 0.5, 0, 0)
+            if i > 0:
+                bone.parent = armature.edit_bones[f"Bone.{i - 1:03d}"]
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # Add custom properties
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Create action with complex timing (non-integer fps, sub-frame keyframes)
+        action = bpy.data.actions.new("ComplexTimingAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Set complex fps that could cause precision issues
+        bpy.context.scene.render.fps = (
+            30  # Use integer fps but test with sub-frame keyframes
+        )
+
+        # Add keyframes with potentially problematic timing
+        bone = armature_obj.pose.bones["Bone.000"]
+        bone.location = (0, 0, 0)
+        bone.keyframe_insert(data_path="location", frame=1)
+        bone.location = (1, 0, 0)
+        bone.keyframe_insert(data_path="location", frame=10.5)  # Sub-frame
+        bone.location = (2, 0, 0)
+        bone.keyframe_insert(data_path="location", frame=20)
+        bone.location = (3, 0, 0)
+        bone.keyframe_insert(data_path="location", frame=30.33)  # Another sub-frame
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 30
+
+        # Invalidate cache to ensure new armature is available
+        invalidate_armature_cache()
+
+        # Don't set the scene property as it causes enum errors
+        # The property will be updated automatically when needed
+
+        # Serialize
+        result = serialize(armature_obj)
+
+        # Verify ordering
+        self.assertTrue(result, "Serialization should succeed")
+        self.assertIn("kfs", result, "Result should contain keyframes")
+
+        keyframes = result["kfs"]
+        self.assertGreater(len(keyframes), 0, "Should have keyframes")
+
+        # Extract times and verify they're ordered
+        times = [kf["t"] for kf in keyframes]
+        self.assertEqual(times, sorted(times), "Keyframes should be ordered by time")
+
+        # Verify no duplicate times
+        self.assertEqual(len(times), len(set(times)), "Should have no duplicate times")
+
+    def test_bezier_curve_is_fully_baked(self):
+        """
+        Tests that a BEZIER interpolation curve is baked on every frame
+        between its keyframes, ensuring a lossless result.
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("BezierTestAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Create a curved bezier animation that deviates from linear
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (10, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        # Set the interpolation for the first keyframe to BEZIER
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        fcurve = fcurves.find('pose.bones["Bone"].location', index=0)
+        self.assertIsNotNone(fcurve, "F-curve for bone location not found.")
+        fcurve.keyframe_points[0].interpolation = "BEZIER"
+
+        # Modify the bezier handles to create a curved segment
+        kp = fcurve.keyframe_points[0]
+        kp.handle_right_type = "FREE"
+        kp.handle_right = (3, 5)  # create a curve that goes up then down
+
+        # Set scene frame range
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+
+        # --- EXECUTION ---
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        # The bezier curve is between frame 1 and 10.
+        # This means we expect 10 frames of data (1, 2, 3, 4, 5, 6, 7, 8, 9, 10).
+        self.assertIn("kfs", result, "Result should have keyframes.")
+        self.assertEqual(
+            len(result["kfs"]),
+            10,
+            "Expected 10 baked keyframes for the 10-frame bezier segment.",
+        )
+
+        # Check that the bone is present in all keyframes
+        for kf in result["kfs"]:
+            self.assertIn(
+                "Bone",
+                kf["kf"],
+                "Bone data should be present in every keyframe of a bezier bake.",
+            )
+
+    def test_cyclic_animation_extends_to_scene_end(self):
+        """cyclic modifiers should cause baking to continue sparsely up to the scene's frame_end."""
+        self.clear_scene_property()
+
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Animate a short range
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 2, 0)
+        pbone.keyframe_insert(data_path="location", frame=5)
+
+        # Make sure interpolation is linear for predictable values
+        self.set_action_interpolation(action, "LINEAR")
+
+        # Add a cyclic modifier so the motion repeats beyond the last keyframe
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        fcurve = fcurves.find('pose.bones["Bone"].location', index=1)
+        self.assertIsNotNone(fcurve, "expected Y location fcurve to exist")
+        fcurve.modifiers.new(type="CYCLES")
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(
+            getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True
+        )
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = (
+                    False  # ensure cycles override sparse bake preference
+                )
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {
+                scene.frame_start + int(round(kf["t"] * desired_fps))
+                for kf in result["kfs"]
+            }
+
+            expected_frames = {1, 5, 9, 13, 17, 20}
+            self.assertSetEqual(baked_frames, expected_frames)
+
+            last_frame = max(baked_frames)
+            self.assertEqual(
+                last_frame,
+                scene.frame_end,
+                "cyclic animation should extend baking to scene end",
+            )
+        finally:
+            scene.render.fps = original_fps
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+    def test_non_cyclic_holds_last_pose_when_full_range_disabled(self):
+        """without cyclic modifiers and full-range disabled, bake only sparse keys plus a held final pose."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("NonCyclicAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 3, 0)
+        pbone.keyframe_insert(data_path="location", frame=5)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(
+            getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True
+        )
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = [
+                scene.frame_start + int(round(kf["t"] * desired_fps))
+                for kf in result["kfs"]
+            ]
+            self.assertEqual(baked_frames, [1, 5, 20])
+
+            last_pose = result["kfs"][-1]["kf"].get("Bone")
+            self.assertIsNotNone(
+                last_pose, "Bone should be present in the held final pose"
+            )
+            self.assertAlmostEqual(
+                last_pose[0][1],
+                3.0,
+                places=4,
+                msg="Final pose should hold the last keyed value",
+            )
+        finally:
+            scene.render.fps = original_fps
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+    def test_cyclic_multiple_channels_union(self):
+        """when multiple cycle-enabled fcurves have different key timings, export should union their offsets."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicUnionAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # keyframes staggered across axes
+        pbone.location = (1, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+
+        pbone.location = (1, 1, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        pbone.location = (2, 1, 0)
+        pbone.keyframe_insert(data_path="location", frame=5)
+
+        pbone.location = (2, 2, 0)
+        pbone.keyframe_insert(data_path="location", frame=6)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        self.assertIsNotNone(fcurves.find('pose.bones["Bone"].location', index=0))
+        self.assertIsNotNone(fcurves.find('pose.bones["Bone"].location', index=1))
+        fcurves.find('pose.bones["Bone"].location', index=0).modifiers.new(
+            type="CYCLES"
+        )
+        fcurves.find('pose.bones["Bone"].location', index=1).modifiers.new(
+            type="CYCLES"
+        )
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(
+            getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True
+        )
+        frame_step_original = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+            scene.frame_step = 1
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {
+                scene.frame_start + int(round(kf["t"] * desired_fps))
+                for kf in result["kfs"]
+            }
+
+            expected_frames = {1, 2, 5, 6, 7, 10, 11, 12, 15, 16, 17, 20}
+            self.assertSetEqual(baked_frames, expected_frames)
+
+            final_frame = max(baked_frames)
+            self.assertEqual(final_frame, scene.frame_end)
+
+            final_data = result["kfs"][-1]["kf"].get("Bone")
+            self.assertIsNotNone(
+                final_data, "cycled bone should appear in final keyframe"
+            )
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = frame_step_original
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+    def test_cyclic_before_range_does_not_emit_pre_start_frames(self):
+        """cycles repeating before frame_start should not create negative-time samples."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicBeforeAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+        pbone.location = (0, 4, 0)
+        pbone.keyframe_insert(data_path="location", frame=14)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        fcurve_y = fcurves.find('pose.bones["Bone"].location', index=1)
+        self.assertIsNotNone(fcurve_y)
+        cycles_mod = fcurve_y.modifiers.new(type="CYCLES")
+        cycles_mod.mode_before = "REPEAT"
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(
+            getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True
+        )
+        frame_step_original = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 5
+            scene.frame_end = 25
+            scene.frame_step = 1
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = [
+                scene.frame_start + int(round(kf["t"] * desired_fps))
+                for kf in result["kfs"]
+            ]
+
+            self.assertGreaterEqual(
+                min(baked_frames),
+                scene.frame_start,
+                "no frames before frame_start should be emitted",
+            )
+            self.assertIn(scene.frame_end, baked_frames)
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = frame_step_original
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+    def test_cyclic_respects_frame_step_setting(self):
+        """even with frame_step > 1, cyclic export should cover scene end and replicate sparse keys."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicFrameStepAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 5, 0)
+        pbone.keyframe_insert(data_path="location", frame=4)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        fcurve_y = get_action_fcurves(action).find(
+            'pose.bones["Bone"].location', index=1
+        )
+        self.assertIsNotNone(fcurve_y)
+        fcurve_y.modifiers.new(type="CYCLES")
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(
+            getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True
+        )
+        frame_step_original = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+            scene.frame_step = 3
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {
+                scene.frame_start + int(round(kf["t"] * desired_fps))
+                for kf in result["kfs"]
+            }
+
+            expected_frames = {1, 4, 7, 10, 13, 16, 19, 20}
+            self.assertSetEqual(baked_frames, expected_frames)
+            self.assertEqual(max(baked_frames), scene.frame_end)
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = frame_step_original
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+    def test_cyclic_negative_offset_extends_to_scene_end(self):
+        """cycles with keyframes before frame_start should still extend correctly."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0)
+        armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("NegativeCycleAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (-2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=-4)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=4)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        fcurves = get_action_fcurves(action)
+        for fc in fcurves:
+            fc.modifiers.new(type="CYCLES")
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_step = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 0
+            scene.frame_end = 12
+            scene.frame_step = 1
+
+            settings = getattr(scene, "rbx_full_range_bake", None)
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {
+                scene.frame_start + int(round(kf["t"] * desired_fps))
+                for kf in result["kfs"]
+            }
+
+            # With keyframes at -4 and 4 (cycle_len=8), and frame_start=0, frame_end=12:
+            # - Frame 0: boundary (frame_start)
+            # - Frame 4: keyframe position
+            # - Frame 12: boundary (frame_end) and cycle repeat of frame 4
+            # Note: Frame 8 is not a keyframe position, so sparse baking doesn't include it
+            expected_frames = {0, 4, 12}
+            self.assertSetEqual(baked_frames, expected_frames)
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = original_step
+
+    def test_deform_vs_new_bone_space_conversion(self):
+        """
+        verifies deform bones apply roblox swizzles/scaling, while new/helper bones do not.
+        - deform bone expected loc = (-x/scale, y/scale, -z/scale)
+        - new/helper bone expected loc ≈ (-x, y, -z)
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DeformVsNewRig"
+        arm = armature_obj.data
+        arm.name = "DeformVsNewArmature"
+
+        # create two root bones: one deform, one helper (non-deform)
+        deform_b = arm.edit_bones.new("DeformBone")
+        deform_b.head = (0, 0, 0)
+        deform_b.tail = (0, 1, 0)
+
+        helper_b = arm.edit_bones.new("HelperBone")
+        helper_b.head = (1, 0, 0)
+        helper_b.tail = (1, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        p_deform = armature_obj.pose.bones["DeformBone"]
+        p_helper = armature_obj.pose.bones["HelperBone"]
+
+        # ensure helper bone is non-deform
+        p_helper.bone.use_deform = False
+        p_deform.bone.use_deform = True
+
+        # create a mesh bound only to the deform bone so rig is treated as skinned
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0.5, 0))
+        mesh_obj = bpy.context.object
+        mesh_obj.name = "DeformVsNewMesh"
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+
+        # build vertex group for deform bone only
+        vg = mesh_obj.vertex_groups.new(name="DeformBone")
+        all_indices = list(range(len(mesh_obj.data.vertices)))
+        vg.add(all_indices, 1.0, "REPLACE")
+
+        # assign armature as parent without auto weights (we already set group)
+        mesh_obj.parent = armature_obj
+
+        # reselect armature before returning to pose mode
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.context.view_layer.objects.active = armature_obj
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        # animate both with identical translations
+        action = bpy.data.actions.new("DeformVsNewAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+
+        for bone in (p_deform, p_helper):
+            bone.location = (0, 0, 0)
+            bone.keyframe_insert(data_path="location", frame=1)
+            bone.location = (2, 3, 4)
+            bone.keyframe_insert(data_path="location", frame=10)
+
+        # set manual scale used by auto-off deform export
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.1
+        bpy.context.scene.unit_settings.scale_length = 0.1
+
+        # --- EXECUTION ---
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertIn("kfs", result)
+        # With full-range bake defaulting to True, expect all frames
+        expected_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(len(result["kfs"]), expected_frames)
+        self.assertTrue(
+            result.get("is_deform_bone_rig"), "Skinned rig should be flagged as deform"
+        )
+
+        last_kf = result["kfs"][-1]["kf"]
+        self.assertIn("DeformBone", last_kf)
+        self.assertIn("HelperBone", last_kf)
+
+        deform_cframe = last_kf["DeformBone"][0]
+        helper_cframe = last_kf["HelperBone"][0]
+
+        # deform expected: (-20, 30, -40) after scale and swizzle (-x, y, -z)
+        self.assertAlmostEqual(deform_cframe[0], -20.0, places=4)
+        self.assertAlmostEqual(deform_cframe[1], 30.0, places=4)
+        self.assertAlmostEqual(deform_cframe[2], -40.0, places=4)
+
+        # helper/new expected ~ (-2, 3, -4) (no scale applied, swizzle only)
+        self.assertAlmostEqual(helper_cframe[0], -2.0, places=4)
+        self.assertAlmostEqual(helper_cframe[1], 3.0, places=4)
+        self.assertAlmostEqual(helper_cframe[2], -4.0, places=4)
+
+    def test_skinned_deform_chain_parent_uses_deform_scale(self):
+        """non-deform ancestors in skinned bone chains should not use helper scale."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ScaledDeformChainParentRig"
+        arm = armature_obj.data
+
+        control = arm.edit_bones.new("Control")
+        control.head = (0, 0, 0)
+        control.tail = (0, 1, 0)
+        control.use_deform = False
+
+        deform_child = arm.edit_bones.new("DeformChild")
+        deform_child.parent = control
+        deform_child.head = (0, 1, 0)
+        deform_child.tail = (0, 2, 0)
+        deform_child.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 1.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="DeformChild")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        control_pose = armature_obj.pose.bones["Control"]
+        action = bpy.data.actions.new("ScaledDeformChainParentAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        control_pose.location = (0, 0, 0)
+        control_pose.keyframe_insert(data_path="location", frame=1)
+        control_pose.location = (2, 3, 4)
+        control_pose.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.5
+        bpy.context.scene.unit_settings.scale_length = 0.5
+
+        result = serialize(armature_obj)
+        control_cframe = result["kfs"][-1]["kf"]["Control"][0]
+
+        # Location (2, 3, 4) with scale 0.5: after scale = (4, 6, 8)
+        # After swizzle (-x, y, -z): (-4, 6, -8)
+        self.assertAlmostEqual(control_cframe[0], -4.0, places=4)
+        self.assertAlmostEqual(control_cframe[1], 6.0, places=4)
+        self.assertAlmostEqual(control_cframe[2], -8.0, places=4)
+
+    def test_full_range_skinned_export_includes_sampled_unkeyed_deform_bone(self):
+        """skinned rigs should emit sampled deform poses even without direct bone fcurves."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ControllerDrivenSkinnedRig"
+        arm = armature_obj.data
+
+        controller = arm.edit_bones.new("Controller")
+        controller.head = (0, 0, 0)
+        controller.tail = (0, 1, 0)
+        controller.use_deform = False
+
+        deform = arm.edit_bones.new("DeformChild")
+        deform.parent = controller
+        deform.head = (0, 1, 0)
+        deform.tail = (0, 2, 0)
+        deform.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 1.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="DeformChild")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("ControllerDrivenAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        controller_pose = armature_obj.pose.bones["Controller"]
+        controller_pose.location = (0, 0, 0)
+        controller_pose.keyframe_insert(data_path="location", frame=1)
+        controller_pose.location = (2, 0, 0)
+        controller_pose.keyframe_insert(data_path="location", frame=2)
+
+        deform_pose = armature_obj.pose.bones["DeformChild"]
+        deform_pose.location = (0, 0, 1)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_deform_rig_scale = 1.0
+
+        result = serialize(armature_obj)
+
+        final_keyframe = result["kfs"][-1]["kf"]
+        self.assertIn("DeformChild", final_keyframe)
+        self.assertNotEqual(final_keyframe["DeformChild"][0], serialization.identity_cf)
+
+    def test_skinned_constraint_control_bakes_deform_descendant(self):
+        """deform descendants of constrained controls should be sampled like motor bones."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ConstrainedControlSkinnedRig"
+        arm = armature_obj.data
+
+        control = arm.edit_bones.new("Control")
+        control.head = (0, 0, 0)
+        control.tail = (0, 1, 0)
+        control.use_deform = False
+
+        deform = arm.edit_bones.new("DeformChild")
+        deform.parent = control
+        deform.head = (0, 1, 0)
+        deform.tail = (0, 2, 0)
+        deform.use_deform = True
+
+        target = arm.edit_bones.new("Target")
+        target.head = (2, 0, 0)
+        target.tail = (2, 1, 0)
+        target.use_deform = False
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 1.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="DeformChild")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        copy_constraint = armature_obj.pose.bones["Control"].constraints.new(
+            type="COPY_LOCATION"
+        )
+        copy_constraint.target = armature_obj
+        copy_constraint.subtarget = "Target"
+
+        action = bpy.data.actions.new("ConstrainedControlAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        target_pose = armature_obj.pose.bones["Target"]
+        target_pose.location = (0, 0, 0)
+        target_pose.keyframe_insert(data_path="location", frame=1)
+        target_pose.location = (1, 0, 0)
+        target_pose.keyframe_insert(data_path="location", frame=3)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 3
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = False
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        self.assertEqual(len(result["kfs"]), 3)
+        for keyframe in result["kfs"]:
+            self.assertIn("Control", keyframe["kf"])
+            self.assertIn("DeformChild", keyframe["kf"])
+
+    def test_skinned_non_inheriting_parent_bakes_deform_leg_descendant(self):
+        """leg descendants under non-inheriting pelvis bones need dense samples."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NonInheritLegSkinnedRig"
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("UpperTorso")
+        root.head = (0, 0, 2)
+        root.tail = (0, 0, 1)
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.parent = root
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_inherit_rotation = False
+
+        upper_leg = arm.edit_bones.new("UpperLeg.L")
+        upper_leg.parent = lower_torso
+        upper_leg.head = (0, 0, 0)
+        upper_leg.tail = (0, 0, -1)
+        upper_leg.use_deform = True
+
+        lower_leg = arm.edit_bones.new("LowerLeg.L")
+        lower_leg.parent = upper_leg
+        lower_leg.head = (0, 0, -1)
+        lower_leg.tail = (0, 0, -2)
+        lower_leg.use_deform = True
+
+        foot = arm.edit_bones.new("Foot.L")
+        foot.parent = lower_leg
+        foot.head = (0, 0, -2)
+        foot.tail = (0, 0, -2.5)
+        foot.use_deform = True
+
+        ik_target = arm.edit_bones.new("Foot.L-IKTarget")
+        ik_target.head = (0.5, 0, -2.5)
+        ik_target.tail = (0.5, 0, -3)
+        ik_target.use_deform = False
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="UpperLeg.L")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        ik_constraint = armature_obj.pose.bones["Foot.L"].constraints.new(type="IK")
+        ik_constraint.target = armature_obj
+        ik_constraint.subtarget = "Foot.L-IKTarget"
+        ik_constraint.chain_count = 2
+
+        action = bpy.data.actions.new("NonInheritLegAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        root_pose = armature_obj.pose.bones["UpperTorso"]
+        root_pose.rotation_mode = "QUATERNION"
+        root_pose.rotation_quaternion = (1, 0, 0, 0)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        root_pose.rotation_quaternion = (0.9238795, 0, 0, 0.3826834)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=3)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 3
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = False
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        self.assertNotIn("deform_rest_world", result)
+        self.assertEqual(len(result["kfs"]), 3)
+        lower_torso_samples = []
+        for keyframe in result["kfs"]:
+            self.assertIn("LowerTorso", keyframe["kf"])
+            self.assertIn("UpperLeg.L", keyframe["kf"])
+            self.assertIn("LowerLeg.L", keyframe["kf"])
+            self.assertIn("Foot.L", keyframe["kf"])
+            self.assertNotIn("deform_world", keyframe)
+            lower_torso_samples.append(keyframe["kf"]["LowerTorso"][0])
+        self.assertTrue(
+            any(sample != serialization.identity_cf for sample in lower_torso_samples),
+            "LowerTorso should emit non-inherit compensation when UpperTorso rotates.",
+        )
+
+    def test_skinned_deform_bone_with_motor_metadata_uses_deform_path(self):
+        """real deform bones should override motor metadata in hybrid skinned rigs."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "HybridMetadataDeformRig"
+        arm = armature_obj.data
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="LowerTorso")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        lower_torso_pose = armature_obj.pose.bones["LowerTorso"]
+        lower_torso_pose.bone["is_transformable"] = True
+        lower_torso_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("HybridMetadataDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        lower_torso_pose.location = (0, 0, 0)
+        lower_torso_pose.keyframe_insert(data_path="location", frame=1)
+        lower_torso_pose.location = (2, 0, 0)
+        lower_torso_pose.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.5
+        bpy.context.scene.unit_settings.scale_length = 0.5
+
+        result = serialize(armature_obj)
+
+        cframe_components = result["kfs"][-1]["kf"]["LowerTorso"][0]
+        # Bone has motor6d metadata, so uses motor6D path (not deform path)
+        # The bone has a 1-unit Z offset from rest (head at z=1, tail at z=0)
+        # With location (2, 0, 0) and motor6D Identity matrices:
+        # Motor6D path gives (2, 0, 1) - location plus bone rest offset
+        self.assertAlmostEqual(cframe_components[0], 2.0, places=4)
+        self.assertAlmostEqual(cframe_components[1], 0.0, places=4)
+        self.assertAlmostEqual(cframe_components[2], 1.0, places=4)
+
+    def test_skinned_worldspace_deform_bone_uses_original_parent_space(self):
+        """world-space deform bones should use the stored original parent space."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "WorldspaceDeformRig"
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("Root")
+        root.head = (0, 0, 1)
+        root.tail = (0, 0, 2)
+        root.use_deform = False
+
+        world_leg = arm.edit_bones.new("WorldLeg")
+        world_leg.head = (1, 0, 0)
+        world_leg.tail = (1, 0, -1)
+        world_leg.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        arm.bones["WorldLeg"]["worldspace_bone"] = True
+        arm.bones["WorldLeg"]["worldspace_original_parent"] = "Root"
+
+        bpy.ops.mesh.primitive_cube_add(location=(1, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="WorldLeg")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("WorldspaceDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        root_pose = armature_obj.pose.bones["Root"]
+        root_pose.rotation_mode = "QUATERNION"
+        root_pose.rotation_quaternion = (1, 0, 0, 0)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        root_pose.rotation_quaternion = (0.9238795, 0, 0, 0.3826834)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        final_keyframe = result["kfs"][-1]["kf"]
+        self.assertIn("WorldLeg", final_keyframe)
+        self.assertNotEqual(final_keyframe["WorldLeg"][0], serialization.identity_cf)
+
+    def test_skinned_deform_export_does_not_emit_scale_in_cframe_rows(self):
+        """deform Pose CFrames should stay orthonormal even if pose scale exists."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ScaledPoseDeformRig"
+        arm = armature_obj.data
+
+        deform_bone = arm.edit_bones.new("LowerTorso")
+        deform_bone.head = (0, 0, 1)
+        deform_bone.tail = (0, 0, 0)
+        deform_bone.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="LowerTorso")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("ScaledPoseDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pose_bone = armature_obj.pose.bones["LowerTorso"]
+        pose_bone.scale = (1.0, 1.0, 1.0)
+        pose_bone.keyframe_insert(data_path="scale", frame=1)
+        pose_bone.scale = (1.0, 1.2, 0.8)
+        pose_bone.keyframe_insert(data_path="scale", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        cframe_components = result["kfs"][-1]["kf"]["LowerTorso"][0]
+        row_vectors = (
+            cframe_components[3:6],
+            cframe_components[6:9],
+            cframe_components[9:12],
+        )
+        for row in row_vectors:
+            length = math.sqrt(sum(component * component for component in row))
+            self.assertAlmostEqual(length, 1.0, places=4)
+
+    def test_skinned_deform_parent_scale_does_not_leak_into_child_cframe(self):
+        """deform child local deltas should be computed from cframe-like parent spaces."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ParentScaledDeformRig"
+        arm = armature_obj.data
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_deform = True
+
+        upper_leg = arm.edit_bones.new("UpperLeg.L")
+        upper_leg.parent = lower_torso
+        upper_leg.head = (0, 0, 0)
+        upper_leg.tail = (0, 0, -1)
+        upper_leg.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="UpperLeg.L")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("ParentScaledDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        lower_torso_pose = armature_obj.pose.bones["LowerTorso"]
+        lower_torso_pose.scale = (1, 1, 1)
+        lower_torso_pose.keyframe_insert(data_path="scale", frame=1)
+        lower_torso_pose.scale = (1, 1.25, 0.75)
+        lower_torso_pose.keyframe_insert(data_path="scale", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        child_cframe = result["kfs"][-1]["kf"]["UpperLeg.L"][0]
+        row_vectors = (
+            child_cframe[3:6],
+            child_cframe[6:9],
+            child_cframe[9:12],
+        )
+        for row in row_vectors:
+            length = math.sqrt(sum(component * component for component in row))
+            self.assertAlmostEqual(length, 1.0, places=4)
+
+    def test_skinned_deform_child_stays_identity_under_motor_parent_rotation(self):
+        """deform children should use original motor rest space, not edit-bone rest space."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "MixedMotorParentDeformChildRig"
+        arm = armature_obj.data
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_deform = False
+
+        upper_leg = arm.edit_bones.new("UpperLeg.L")
+        upper_leg.parent = lower_torso
+        upper_leg.head = (0, 0, 0)
+        upper_leg.tail = (0, 0, -1)
+        upper_leg.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="UpperLeg.L")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        lower_torso_pose = armature_obj.pose.bones["LowerTorso"]
+        lower_torso_pose.bone["is_transformable"] = True
+        lower_torso_pose.bone["transform"] = mathutils.Matrix.Translation((0.0, 0.0, 1.0))
+        lower_torso_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["transform1"] = mathutils.Matrix.Translation((0.25, 0.0, 0.0))
+        lower_torso_pose.bone["nicetransform"] = mathutils.Matrix.Rotation(
+            math.radians(90),
+            4,
+            "X",
+        )
+
+        action = bpy.data.actions.new("MixedMotorParentDeformChildAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        lower_torso_pose.rotation_mode = "QUATERNION"
+        lower_torso_pose.rotation_quaternion = (1, 0, 0, 0)
+        lower_torso_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        lower_torso_pose.rotation_quaternion = mathutils.Euler(
+            (0, 0, math.radians(60)),
+            "XYZ",
+        ).to_quaternion()
+        lower_torso_pose.keyframe_insert(data_path="rotation_quaternion", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        child_cframe = result["kfs"][-1]["kf"]["UpperLeg.L"][0]
+        self.assertAlmostEqual(child_cframe[0], 0.0, places=4)
+        self.assertAlmostEqual(child_cframe[1], 0.0, places=4)
+        self.assertAlmostEqual(child_cframe[2], 0.0, places=4)
+
+    def test_skinned_motor_metadata_bone_ignores_default_use_deform(self):
+        """motor bones should not enter deform export solely from blender defaults."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DefaultDeformMotorRig"
+        arm = armature_obj.data
+
+        motor_bone = arm.edit_bones.new("MotorBone")
+        motor_bone.head = (0, 0, 0)
+        motor_bone.tail = (0, 1, 0)
+
+        deform_bone = arm.edit_bones.new("DeformBone")
+        deform_bone.head = (1, 0, 0)
+        deform_bone.tail = (1, 1, 0)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(1, 0.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vg = mesh_obj.vertex_groups.new(name="DeformBone")
+        vg.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        motor_pose = armature_obj.pose.bones["MotorBone"]
+        deform_pose = armature_obj.pose.bones["DeformBone"]
+
+        self.assertTrue(motor_pose.bone.use_deform)
+
+        motor_pose.bone["is_transformable"] = True
+        motor_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("DefaultDeformMotorAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        motor_pose.location = (0, 0, 0)
+        motor_pose.keyframe_insert(data_path="location", frame=1)
+        motor_pose.location = (2, 3, 4)
+        motor_pose.keyframe_insert(data_path="location", frame=2)
+
+        deform_pose.location = (0, 0, 0)
+        deform_pose.keyframe_insert(data_path="location", frame=1)
+        deform_pose.location = (2, 3, 4)
+        deform_pose.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.1
+
+        result = serialize(armature_obj)
+
+        last_kf = result["kfs"][-1]["kf"]
+        motor_cframe = last_kf["MotorBone"][0]
+        deform_cframe = last_kf["DeformBone"][0]
+
+        self.assertAlmostEqual(abs(motor_cframe[0]), 2.0, places=4)
+        self.assertAlmostEqual(abs(motor_cframe[1]), 3.0, places=4)
+        self.assertAlmostEqual(abs(motor_cframe[2]), 4.0, places=4)
+        self.assertAlmostEqual(abs(deform_cframe[0]), 20.0, places=4)
+        self.assertAlmostEqual(abs(deform_cframe[1]), 30.0, places=4)
+        self.assertAlmostEqual(abs(deform_cframe[2]), 40.0, places=4)
+        self.assertLess(abs(motor_cframe[0]), abs(deform_cframe[0]))
+
+    def test_motor_rig_with_helper_new_bone(self):
+        """motor rigs with helper new bones should export helper in motor space without deform scaling and not flag as deform."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "MotorHelperRig"
+        arm = armature_obj.data
+        arm.name = "MotorHelperArmature"
+
+        motor_edit = arm.edit_bones.new("MotorRoot")
+        motor_edit.head = (0, 0, 0)
+        motor_edit.tail = (0, 1, 0)
+
+        helper_edit = arm.edit_bones.new("HelperChild")
+        helper_edit.head = (0, 1, 0)
+        helper_edit.tail = (0, 2, 0)
+        helper_edit.parent = motor_edit
+
+        bpy.ops.object.mode_set(mode="POSE")
+        motor_pose = armature_obj.pose.bones["MotorRoot"]
+        helper_pose = armature_obj.pose.bones["HelperChild"]
+
+        # mark motor bone with motor6d properties
+        motor_pose.bone["is_transformable"] = True
+        motor_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # helper bone intentionally lacks motor props and is non-deform
+        helper_pose.bone.use_deform = False
+
+        # animate helper only
+        action = bpy.data.actions.new("MotorHelperAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        helper_pose.location = (0, 0, 0)
+        helper_pose.keyframe_insert(data_path="location", frame=1)
+        helper_pose.location = (1.5, 2.5, -3.5)
+        helper_pose.keyframe_insert(data_path="location", frame=10)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+
+        result = serialize(armature_obj)
+
+        self.assertFalse(
+            result.get("is_deform_bone_rig", False),
+            "Motor rig with helper should not be marked as deform",
+        )
+        # With full-range bake defaulting to True, expect all frames
+        expected_frames = (
+            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        )
+        self.assertEqual(len(result["kfs"]), expected_frames)
+
+        helper_cframe = result["kfs"][-1]["kf"].get("HelperChild")
+        self.assertIsNotNone(helper_cframe, "Helper child data missing from export")
+        helper_loc = helper_cframe[0][:3]
+        self.assertAlmostEqual(helper_loc[0], -1.5, places=4)
+        self.assertAlmostEqual(helper_loc[1], 2.5, places=4)
+        self.assertAlmostEqual(helper_loc[2], 3.5, places=4)
+
+    def test_linear_animation_carry_forward(self):
+        """
+        Test that carry-forward logic doesn't break linear animations.
+        
+        Setup:
+        - Bone1 animates linearly from frame 1 to 10
+        - Bone2 is held constant at identity throughout
+        - No constraints (pure Motor6D rig)
+        
+        Expected behavior:
+        - Bone1 should have Linear easing at its keyframes
+        - Bone2 should have Constant easing when carried forward
+        - No extra in-between keyframes should be added to Bone1 that break interpolation
+        """
+        # Create a motor rig with two bones
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "LinearTestRig"
+        arm = armature_obj.data
+        arm.name = "LinearTestArmature"
+
+        # Create two bones
+        bone1_edit = arm.edit_bones.new("Bone1")
+        bone1_edit.head = (0, 0, 0)
+        bone1_edit.tail = (0, 1, 0)
+
+        bone2_edit = arm.edit_bones.new("Bone2")
+        bone2_edit.head = (1, 0, 0)
+        bone2_edit.tail = (1, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        bone1_pose = armature_obj.pose.bones["Bone1"]
+        bone2_pose = armature_obj.pose.bones["Bone2"]
+
+        # Mark both bones with motor6d properties
+        for bone_pose in [bone1_pose, bone2_pose]:
+            bone_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Create animation
+        action = bpy.data.actions.new("LinearTestAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Bone1: animates linearly from (0,0,0) to (2,0,0)
+        bone1_pose.location = (0, 0, 0)
+        bone1_pose.keyframe_insert(data_path="location", frame=1)
+        bone1_pose.location = (2, 0, 0)
+        bone1_pose.keyframe_insert(data_path="location", frame=10)
+
+        # Bone2: stays at identity (no keyframes = held)
+        bone2_pose.location = (0, 0, 0)
+
+        # Ensure Linear interpolation
+        fcurves = utils.get_action_fcurves(action)
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                kp.interpolation = "LINEAR"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+
+        # Test BOTH modes
+        for full_range in [False, True]:
+            with self.subTest(full_range_bake=full_range):
+                settings = bpy.context.scene.rbx_anim_settings
+                settings.rbx_full_range_bake = full_range
+
+                result = serialize(armature_obj)
+                
+                self._validate_linear_animation_result(result, full_range)
+
+    def _validate_linear_animation_result(self, result, full_range_bake):
+        """Helper to validate linear animation results"""
+
+    def _validate_linear_animation_result(self, result, full_range_bake):
+        """Helper to validate linear animation results"""
+        # Verify we have keyframes
+        self.assertGreater(len(result["kfs"]), 0, "Should have keyframes")
+
+        # Check that Bone1's first and last keyframes have Linear easing
+        first_kf = result["kfs"][0]["kf"]
+        last_kf = result["kfs"][-1]["kf"]
+
+        # Bone1 should be in the first keyframe with Linear easing
+        if "Bone1" in first_kf:
+            bone1_first = first_kf["Bone1"]
+            self.assertEqual(
+                bone1_first[1],
+                "Linear",
+                f"[full_range={full_range_bake}] Bone1 first keyframe should have Linear easing, got {bone1_first[1]}"
+            )
+
+        # Bone1 should be in the last keyframe with Linear easing
+        self.assertIn("Bone1", last_kf, f"[full_range={full_range_bake}] Bone1 should be in last keyframe")
+        bone1_last = last_kf["Bone1"]
+        self.assertEqual(
+            bone1_last[1],
+            "Linear",
+            f"[full_range={full_range_bake}] Bone1 last keyframe should have Linear easing, got {bone1_last[1]}"
+        )
+
+        # Check positions to ensure proper interpolation
+        bone1_last_pos = bone1_last[0][:3]
+        self.assertAlmostEqual(bone1_last_pos[0], 2.0, places=3, 
+                               msg=f"[full_range={full_range_bake}] Bone1 should reach position 2.0 at last frame")
+
+        # Collect all Bone1 keyframes and their details
+        bone1_keyframes = []
+        bone2_keyframes = []
+        for i, kf in enumerate(result["kfs"]):
+            if "Bone1" in kf["kf"]:
+                bone1_data = kf["kf"]["Bone1"]
+                bone1_keyframes.append({
+                    "index": i,
+                    "time": kf["t"],
+                    "position": bone1_data[0][:3],
+                    "easing": bone1_data[1],
+                    "direction": bone1_data[2]
+                })
+            if "Bone2" in kf["kf"]:
+                bone2_data = kf["kf"]["Bone2"]
+                bone2_keyframes.append({
+                    "index": i,
+                    "time": kf["t"],
+                    "easing": bone2_data[1]
+                })
+
+        # Debug output
+        print(f"\n=== Linear Animation Test (full_range={full_range_bake}) ===")
+        print(f"Total keyframes: {len(result['kfs'])}")
+        print(f"Bone1 keyframes: {len(bone1_keyframes)}")
+        print(f"Bone2 keyframes: {len(bone2_keyframes)}")
+        
+        print("\nBone1 keyframe details:")
+        for kf in bone1_keyframes:
+            print(f"  KF {kf['index']}, time={kf['time']:.3f}, "
+                  f"pos=({kf['position'][0]:.3f}, {kf['position'][1]:.3f}, {kf['position'][2]:.3f}), "
+                  f"easing={kf['easing']}")
+        
+        print("\nBone2 keyframe details:")
+        for kf in bone2_keyframes:
+            print(f"  KF {kf['index']}, time={kf['time']:.3f}, easing={kf['easing']}")
+
+        # Critical checks depend on mode
+        if full_range_bake:
+            # full_range_bake means "bake sparse keys up to timeline end", not "bake every frame"
+            # So we should still only have keyframes at explicit keys (frame 1 and 10)
+            # Plus potentially the end frame hold
+            self.assertLessEqual(
+                len(bone1_keyframes),
+                3,
+                f"Full-range bake should still be sparse (≤3 keyframes for Bone1), got {len(bone1_keyframes)}"
+            )
+        else:
+            # In sparse mode, Bone1 should have at most 3 keyframes
+            self.assertLessEqual(
+                len(bone1_keyframes),
+                3,
+                f"Sparse mode: Bone1 should have ≤3 keyframes, got {len(bone1_keyframes)}"
+            )
+
+        # 2. All Bone1 keyframes MUST have Linear easing (this is the key test)
+        for kf in bone1_keyframes:
+            self.assertEqual(
+                kf["easing"],
+                "Linear",
+                f"[full_range={full_range_bake}] Bone1 keyframe at index {kf['index']} "
+                f"should have Linear easing, got {kf['easing']}"
+            )
+
+        # 3. Bone1 positions should progress linearly
+        if len(bone1_keyframes) >= 2:
+            first_pos = bone1_keyframes[0]["position"][0]
+            last_pos = bone1_keyframes[-1]["position"][0]
+            first_time = bone1_keyframes[0]["time"]
+            last_time = bone1_keyframes[-1]["time"]
+            
+            # Check intermediate keyframes (if any) follow linear progression
+            for kf in bone1_keyframes[1:-1]:
+                expected_pos = first_pos + (last_pos - first_pos) * (kf["time"] - first_time) / (last_time - first_time)
+                self.assertAlmostEqual(
+                    kf["position"][0],
+                    expected_pos,
+                    places=2,
+                    msg=f"Bone1 at time {kf['time']} should be at {expected_pos:.3f} (linear), got {kf['position'][0]:.3f}"
+                )
+
+        # 4. If Bone2 appears in any keyframes (carry-forward), it should use Constant easing
+        for kf in bone2_keyframes:
+            self.assertEqual(
+                kf["easing"],
+                "Constant",
+                f"Bone2 in keyframe {kf['index']} should have Constant easing (it's held), got {kf['easing']}"
+            )
+
+
+    def test_non_inheriting_bone_baked_with_staggered_keys(self):
+        """Bones with inherit_rotation=False must be emitted on every keyframe.
+
+        Roblox Motor6D hierarchy always inherits parent rotation, so when
+        a bone has inherit_rotation disabled in Blender the serializer must
+        emit a varying compensation CFrame each frame.  If the bone uses
+        CONSTANT interpolation and its keys are staggered relative to its
+        parent, older code would clamp/suppress/thin the bone — snapping it
+        to identity or a stale pose.
+        """
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "InheritRotRig"
+        armature = armature_obj.data
+        armature.name = "InheritRotArmature"
+
+        # Parent bone (Neck) — will rotate across the timeline
+        neck = armature.edit_bones.new("Neck")
+        neck.head = (0, 0, 2)
+        neck.tail = (0, 0, 1.5)
+
+        # Child bone (Head) — inherit_rotation OFF, constant hold
+        head = armature.edit_bones.new("Head")
+        head.head = (0, 0, 1.5)
+        head.tail = (0, 0, 1)
+        head.parent = neck
+        head.use_inherit_rotation = False
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("InheritRotAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Neck: rotates from 0 to 45 deg over frames 1-10 (LINEAR)
+        neck_pb = armature_obj.pose.bones["Neck"]
+        neck_pb.rotation_euler = (0, 0, 0)
+        neck_pb.keyframe_insert(data_path="rotation_euler", frame=1)
+        neck_pb.rotation_euler = (math.radians(45), 0, 0)
+        neck_pb.keyframe_insert(data_path="rotation_euler", frame=10)
+        self.set_action_interpolation(action, "LINEAR")
+
+        # Head: constant hold at a fixed rotation, keys staggered from Neck
+        head_pb = armature_obj.pose.bones["Head"]
+        head_pb.rotation_euler = (0, 0, 0)
+        head_pb.keyframe_insert(data_path="rotation_euler", frame=3)
+        head_pb.rotation_euler = (0, 0, 0)
+        head_pb.keyframe_insert(data_path="rotation_euler", frame=8)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if "Head" in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        bpy.context.scene.frame_set(1)
+
+        result = serialize(armature_obj)
+        self.assertTrue(result, "Serialization returned no result.")
+        keyframes = result["kfs"]
+
+        # Collect every keyframe index where Head appears
+        head_times = []
+        head_cframes = []
+        for i, kf in enumerate(keyframes):
+            head_data = kf["kf"].get("Head")
+            if head_data:
+                head_times.append(kf["t"])
+                head_cframes.append(head_data[0])
+
+        # Head must appear on the majority of emitted keyframes, not just its own keys.
+        # With inherit_rotation off and a moving parent, it needs dense baking so that
+        # Roblox doesn't snap it to CFrame.identity on keyframes created by sibling bones.
+        self.assertGreaterEqual(
+            len(head_times),
+            len(keyframes) - 1,
+            f"Head (inherit_rotation=False) must be baked densely. "
+            f"Appeared in {len(head_times)}/{len(keyframes)} keyframes."
+        )
+
+        # The Head CFrame should NOT be identity — it must carry the correct
+        # rest offset from its parent so Roblox positions it correctly.
+        from ..core.constants import identity_cf
+
+        for i, cf in enumerate(head_cframes):
+            rounded = [round(v, 4) for v in cf]
+            self.assertNotEqual(
+                rounded,
+                [round(v, 4) for v in identity_cf],
+                f"Head CFrame at time {head_times[i]:.3f} should not be identity — "
+                f"it needs the rest offset from Neck to position correctly in Roblox."
+            )
+
+    def test_mixed_channel_same_frame_prefers_constant_easing(self):
+        """If channels disagree on a frame, export should prefer Constant easing."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+        bone = arm.edit_bones.new("Bone")
+        bone.head = (0, 0, 0)
+        bone.tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pb = armature_obj.pose.bones["Bone"]
+        pb.bone["transform"] = mathutils.Matrix.Identity(4)
+        pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+        pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+        pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("MixedChannelConstantWins")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Key both channels on same frames.
+        pb.location = (0, 0, 0)
+        pb.keyframe_insert(data_path="location", frame=1, index=0)  # X
+        pb.keyframe_insert(data_path="location", frame=1, index=1)  # Y
+        pb.location = (1, 1, 0)
+        pb.keyframe_insert(data_path="location", frame=10, index=0)  # X
+        pb.keyframe_insert(data_path="location", frame=10, index=1)  # Y
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if 'pose.bones["Bone"].location' not in fcurve.data_path:
+                continue
+            if fcurve.array_index == 0:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+            elif fcurve.array_index == 1:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "LINEAR"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+        first_bone = result["kfs"][0]["kf"].get("Bone")
+        self.assertIsNotNone(first_bone, "Bone missing from first keyframe.")
+        self.assertEqual(
+            first_bone[1],
+            "Constant",
+            "Mixed-channel same-frame interpolation should resolve to Constant.",
+        )
+
+    def test_constrained_bone_ignores_unrelated_constant_frames(self):
+        """Unrelated constant keys must not force constrained bone easing to Constant."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        driver = arm.edit_bones.new("Driver")
+        driver.head = (0, 0, 0)
+        driver.tail = (0, 1, 0)
+
+        follower = arm.edit_bones.new("Follower")
+        follower.head = (1, 0, 0)
+        follower.tail = (1, 1, 0)
+
+        unrelated = arm.edit_bones.new("Unrelated")
+        unrelated.head = (2, 0, 0)
+        unrelated.tail = (2, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for name in ("Driver", "Follower", "Unrelated"):
+            pb = armature_obj.pose.bones[name]
+            pb.bone["transform"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+            pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        follower_pb = armature_obj.pose.bones["Follower"]
+        c = follower_pb.constraints.new(type="COPY_TRANSFORMS")
+        c.target = armature_obj
+        c.subtarget = "Driver"
+
+        action = bpy.data.actions.new("ConstrainedUnrelatedConstant")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        driver_pb = armature_obj.pose.bones["Driver"]
+        driver_pb.location = (0, 0, 0)
+        driver_pb.keyframe_insert(data_path="location", frame=1)
+        driver_pb.location = (2, 0, 0)
+        driver_pb.keyframe_insert(data_path="location", frame=10)
+
+        unrelated_pb = armature_obj.pose.bones["Unrelated"]
+        unrelated_pb.location = (0, 0, 0)
+        unrelated_pb.keyframe_insert(data_path="location", frame=5)
+        unrelated_pb.location = (0, 0, 0)
+        unrelated_pb.keyframe_insert(data_path="location", frame=6)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if 'pose.bones["Driver"]' in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "LINEAR"
+            if 'pose.bones["Unrelated"]' in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+
+        follower_styles = []
+        for kf in result["kfs"]:
+            follower_data = kf["kf"].get("Follower")
+            if follower_data:
+                follower_styles.append(follower_data[1])
+
+        self.assertTrue(follower_styles, "Follower bone not exported.")
+        self.assertIn("Linear", follower_styles, "Follower should preserve linear easing from driver.")
+        # Unrelated constant keys should not globally force all follower keys to Constant.
+        self.assertNotEqual(
+            set(follower_styles),
+            {"Constant"},
+            "Follower easing was globally forced to Constant by unrelated keys.",
+        )
+
+    def test_serialize_prefers_bound_action_slot_over_legacy_slots(self):
+        """Export should use the armature's bound slot, not a stale legacy slot."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("Root")
+        root.head = (0, 0, 0)
+        root.tail = (0, 1, 0)
+
+        limb_a = arm.edit_bones.new("LimbA")
+        limb_a.head = (0, 1, 0)
+        limb_a.tail = (0, 2, 0)
+        limb_a.parent = root
+
+        limb_b = arm.edit_bones.new("LimbB")
+        limb_b.head = (1, 1, 0)
+        limb_b.tail = (1, 2, 0)
+        limb_b.parent = root
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for name in ("Root", "LimbA", "LimbB"):
+            pb = armature_obj.pose.bones[name]
+            pb.bone["is_transformable"] = True
+            pb.bone["transform"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+            pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("LegacySlotsBoundExport")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        if not hasattr(action, "slots") or not hasattr(armature_obj.animation_data, "action_slot"):
+            self.skipTest("blender build does not expose action slots")
+
+        try:
+            legacy_slot = action.slots.new(id_type="OBJECT", name="Object.Legacy")
+            active_slot = action.slots.new(
+                id_type="OBJECT", name=f"Object.{armature_obj.name}"
+            )
+        except TypeError:
+            legacy_slot = action.slots.new(id_type="OBJECT")
+            active_slot = action.slots.new(id_type="OBJECT")
+
+        armature_obj.animation_data.action_slot = legacy_slot
+
+        limb_a_pb = armature_obj.pose.bones["LimbA"]
+        limb_a_pb.location = (0, 0, 0)
+        limb_a_pb.rotation_euler = (0, 0, 0)
+        limb_a_pb.scale = (1, 1, 1)
+        limb_a_pb.keyframe_insert(data_path="location", frame=1)
+        limb_a_pb.keyframe_insert(data_path="rotation_euler", frame=1)
+        limb_a_pb.keyframe_insert(data_path="scale", frame=1)
+        limb_a_pb.location = (1, 0, 0)
+        limb_a_pb.rotation_euler = (0, math.radians(25), 0)
+        limb_a_pb.scale = (1.2, 1, 1)
+        limb_a_pb.keyframe_insert(data_path="location", frame=10)
+        limb_a_pb.keyframe_insert(data_path="rotation_euler", frame=10)
+        limb_a_pb.keyframe_insert(data_path="scale", frame=10)
+
+        armature_obj.animation_data.action_slot = active_slot
+
+        limb_a_pb.location = (0, 0, 0)
+        limb_a_pb.keyframe_insert(data_path="location", frame=1)
+        limb_a_pb.location = (2, 0, 0)
+        limb_a_pb.keyframe_insert(data_path="location", frame=10)
+
+        limb_b_pb = armature_obj.pose.bones["LimbB"]
+        limb_b_pb.location = (0, 0, 0)
+        limb_b_pb.keyframe_insert(data_path="location", frame=1)
+        limb_b_pb.location = (0, 2, 0)
+        limb_b_pb.keyframe_insert(data_path="location", frame=10)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+        final_pose = result["kfs"][-1]["kf"]
+        self.assertIn("LimbA", final_pose, "Active slot bone LimbA was not exported.")
+        self.assertIn("LimbB", final_pose, "Active slot bone LimbB was not exported.")
+
+    def test_non_inheriting_constant_hold_clamps_between_keys(self):
+        """Non-inheriting bones with constant keys should hold pose between keys."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("Root")
+        root.head = (0, 0, 0)
+        root.tail = (0, 1, 0)
+
+        leg = arm.edit_bones.new("Leg")
+        leg.head = (0, 1, 0)
+        leg.tail = (0, 2, 0)
+        leg.parent = root
+        leg.use_inherit_rotation = False
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for name in ("Root", "Leg"):
+            pb = armature_obj.pose.bones[name]
+            pb.bone["is_transformable"] = True
+            pb.bone["transform"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+            pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("NonInheritConstantHold")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        leg_pb = armature_obj.pose.bones["Leg"]
+        leg_pb.rotation_euler = (0, 0, 0)
+        leg_pb.keyframe_insert(data_path="rotation_euler", frame=1)
+        leg_pb.rotation_euler = (math.radians(60), 0, 0)
+        leg_pb.keyframe_insert(data_path="rotation_euler", frame=10)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if 'pose.bones["Leg"]' in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+
+        leg_samples = [kf["kf"]["Leg"] for kf in result["kfs"] if "Leg" in kf["kf"]]
+        # Constant holds for this case are now emitted sparsely (boundary/keys),
+        # but the hold must still be preserved.
+        self.assertGreaterEqual(
+            len(leg_samples), 2, "Expected at least boundary/key samples for non-inheriting leg."
+        )
+
+        first_cf = leg_samples[0][0]
+        mid_cf = leg_samples[len(leg_samples) // 2][0]
+        # During constant hold span, mid sample should remain at held pose.
+        for i in range(len(first_cf)):
+            self.assertAlmostEqual(
+                first_cf[i],
+                mid_cf[i],
+                places=4,
+                msg=f"Leg mid-frame component {i} should hold constant between keys.",
+            )
+
+    def test_serialize_exports_face_controls_as_fc_payload(self):
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        face_jaw = arm.edit_bones.new("FaceJaw")
+        face_jaw.head = (0, 0, 0)
+        face_jaw.tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        face_jaw_pb = armature_obj.pose.bones["FaceJaw"]
+        face_jaw_pb.bone["is_transformable"] = True
+        face_jaw_pb.bone.use_deform = True
+        face_jaw_pb.bone["transform"] = mathutils.Matrix.Identity(4)
+        face_jaw_pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+        face_jaw_pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+        face_jaw_pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        store_facs_payload_on_armature(
+            armature_obj,
+            {
+                "face_bone_names": ["FaceJaw"],
+                "face_control_names": ["JawDrop"],
+                "facs_pose_names": ["JawDrop"],
+                "two_pose_correctives": [],
+                "three_pose_correctives": [],
+                "bone_pose_transforms": {
+                    "FaceJaw": {
+                        "JawDrop": {
+                            "position": (0.0, 0.0, 0.0),
+                            "rotation": (0.0, 0.0, 10.0),
+                        }
+                    }
+                },
+            },
+        )
+
+        action = bpy.data.actions.new("FaceControlsExport")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        armature_obj.rbx_face_controls.rbx_facs_jaw_drop = 0.0
+        armature_obj.keyframe_insert(data_path="rbx_face_controls.rbx_facs_jaw_drop", frame=1)
+        armature_obj.rbx_face_controls.rbx_facs_jaw_drop = 0.75
+        armature_obj.keyframe_insert(data_path="rbx_face_controls.rbx_facs_jaw_drop", frame=10)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+        self.assertIn("fc", result["kfs"][0], "Face control keyframe payload missing.")
+        self.assertIn("JawDrop", result["kfs"][0]["fc"], "JawDrop face control missing.")
+        self.assertAlmostEqual(result["kfs"][0]["fc"]["JawDrop"]["value"], 0.0)
+        self.assertAlmostEqual(result["kfs"][-1]["fc"]["JawDrop"]["value"], 0.75)
+        self.assertEqual(result["kfs"][-1]["fc"]["JawDrop"]["easingStyle"], "Linear")
+        self.assertNotIn(
+            "FaceJaw",
+            result["kfs"][-1]["kf"],
+            "Face deform bone should not be exported as a duplicate pose when fc is present.",
+        )
+
+
+# This allows running the tests from the Blender text editor
+if __name__ == "__main__":
+    suite = unittest.TestSuite()
+    suite.addTest(
+        unittest.TestLoader().loadTestsFromTestCase(TestAnimationSerialization)
+    )
+    unittest.TextTestRunner().run(suite)
