@@ -1,67 +1,15 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-dev-debug.log
-
-# Dependency directories
-node_modules/
+# Byte-compiled
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-*.pyd
 
-# Environment variables
-.env
+# Blender backups
+*.blend1
+*.blend2
 
-# Editor directories and files
-.idea
-.vscode
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-.ruff_cache
-.pytest_cache
-.mypy_cache
-
-# OS specific
+# OS
 .DS_Store
 Thumbs.db
 
-# Task files
-tasks.json
-tasks/ 
-
-*lock.json
-*.lock
-
-# Backup files
-*old*.lua
-*.backup
-backup.py
-*.bak
-
-# Build artifacts
-Packages/
-scripts/
-dist/
-build/
-tools/
-
-# Temporary files
-*wally
-*.txt
-*.zip
-*.tmp
-*.temp
-
-# Configuration files (keep essential ones)
-*.lock
-
-# IDE specific
-.vscode/settings.json
-.vscode/launch.json
+# VS Code
+.vscode/
