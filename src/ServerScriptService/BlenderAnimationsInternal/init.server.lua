@@ -308,8 +308,8 @@ do -- Creates the plugin
 		Plugin = Plugin,
 		Toolbar = pluginToolbar,
 		ClickableWhenViewportHidden = true,
-		Name = "Open",
-		ToolTip = "Open Blender Animations Plugin",
+		Name = "Blender Anims",
+		ToolTip = "Open Blender Animations Plugin (Sync & Decals)",
 		Image = DECAL_PLUGIN_LOGO,
 	})
 	
