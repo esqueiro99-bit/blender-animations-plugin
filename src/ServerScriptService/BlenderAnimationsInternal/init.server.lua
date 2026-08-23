@@ -301,7 +301,7 @@ do -- Creates the plugin
 	State.widgetsEnabled = Value(false)
 	State.helpWidgetEnabled = Value(false)
 	
-	local DECAL_PLUGIN_LOGO = "rbxasset://textures/AnimationEditor/TimelineButton.png"
+	local DECAL_PLUGIN_LOGO = "rbxassetid://92189642379919"
 	State.toolbarButtonImage:set(DECAL_PLUGIN_LOGO)
 	
 	local enableButton = ToolbarButton({
@@ -697,7 +697,7 @@ do -- Creates the plugin
 	local function pluginWidget()
 		return Widget({
 			Plugin = Plugin,
-			Id = "BlenderAnimationsMain",
+			Id = "BlenderAnimationsDecals_Main",
 			Name = "Blender Animations",
 			InitialDockTo = State.dockSide:get(),
 			InitialEnabled = false,
@@ -779,9 +779,14 @@ do -- Creates the plugin
 
 	table.insert(State.connections, enableButton.Click:Connect(function()
 		local nextState = not mainWidget.Enabled
-		print("[DEBUG-DECAL] >>> Clique no botao 'Blender (Decals)' detectado! <<<")
+		print("[DEBUG-DECAL] >>> Clique no botao 'Blender Anims' detectado! <<<")
 		print("[DEBUG-DECAL] Alternando visibilidade de " .. tostring(mainWidget.Enabled) .. " para " .. tostring(nextState))
 		mainWidget.Enabled = nextState
+		if nextState then
+			pcall(function()
+				mainWidget:RequestFocus()
+			end)
+		end
 		handleMainWidgetEnabledChanged(nextState)
 		enableButton:SetActive(nextState)
 	end))
