@@ -510,3 +510,86 @@ class OBJECT_PT_RbxAnimations_Tool(bpy.types.Panel):
 
         layout.separator()
         layout.label(text="See 'Rbx Animations' panel for more options")
+
+
+class OBJECT_PT_RbxDecals(bpy.types.Panel):
+    """Dedicated panel for Roblox Decal & Facial Expression Animation."""
+    bl_label = "Decal Expressions (Flipbook)"
+    bl_idname = "OBJECT_PT_RbxDecals"
+    bl_category = "Rbx Animations"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        settings = getattr(scene, "rbx_decals", None)
+        if not settings:
+            layout.label(text="Decal settings not available.", icon='ERROR')
+            return
+
+        # --- Target / Scan Header ---
+        header_box = layout.box()
+        row = header_box.row(align=True)
+        row.label(text="Decal Manager", icon='IMAGE_DATA')
+        row.operator("object.rbx_decal_scan", text="Scan Active", icon='VIEWZOOM')
+
+        row_import = header_box.row(align=True)
+        row_import.scale_y = 1.2
+        row_import.operator("object.rbx_decal_import_images", text="Import Decal Stack (.png)", icon='FILE_IMAGE')
+
+        # --- Flipbook Expression Switcher (1-click buttons) ---
+        items = settings.items
+        if len(items) > 0:
+            flip_box = layout.box()
+            flip_box.label(text="Expression Switcher (Flipbook):", icon='PLAY')
+
+            # Render 4 buttons per row for quick switching
+            cols_per_row = 4
+            for row_idx in range(0, len(items), cols_per_row):
+                btn_row = flip_box.row(align=True)
+                btn_row.scale_y = 1.3
+                for col_idx in range(cols_per_row):
+                    item_idx = row_idx + col_idx
+                    if item_idx < len(items):
+                        item = items[item_idx]
+                        is_visible = item.transparency < 0.5 if settings.transparency_mode == 'ROBLOX' else item.transparency > 0.5
+                        op = btn_row.operator("object.rbx_decal_quick_switch", text=item.name, depress=is_visible)
+                        op.index = item_idx
+
+            # --- Layers & Transparency Sliders ---
+            layers_box = layout.box()
+            layers_box.label(text=f"Decal Layers ({len(items)}):", icon='RENDERLAYERS')
+
+            for i, item in enumerate(items):
+                item_row = layers_box.row(align=True)
+                item_row.prop(item, "transparency", text=item.name, slider=True)
+                solo_op = item_row.operator("object.rbx_decal_solo", text="Solo", icon='RADIOBUT_ON')
+                solo_op.decal_name = item.name
+
+            # --- Settings ---
+            set_box = layout.box()
+            set_box.label(text="Animation Settings:", icon='PREFERENCES')
+            set_box.prop(settings, "interpolation", text="Curve")
+            set_box.prop(settings, "auto_keyframe", text="Auto-Keyframe on Switch")
+            set_box.prop(settings, "transparency_mode", text="Display")
+
+            # --- Actions & Export ---
+            act_box = layout.box()
+            act_box.label(text="Actions & Export:", icon='SCRIPT')
+            row_act = act_box.row(align=True)
+            row_act.operator("object.rbx_decal_keyframe", text="Keyframe All", icon='KEY_HLT')
+            row_act.operator("object.rbx_decal_clear_keyframes", text="Clear Keys", icon='TRASH')
+
+            row_exp = act_box.row(align=True)
+            row_exp.scale_y = 1.2
+            row_exp.operator("object.rbx_decal_export_script", text="Generate Roblox Luau Script", icon='COPYDOWN')
+        else:
+            layout.label(text="No decals found on active mesh/material.", icon='INFO')
+            layout.label(text="Click 'Import Decal Stack' to build layers.")
+

@@ -297,12 +297,86 @@ class RobloxAnimationSettings(PropertyGroup):
     )
 
 
+def _on_decal_transparency_update(self, context):
+    scene = getattr(context, "scene", None)
+    if not scene:
+        return
+    settings = getattr(scene, "rbx_decals", None)
+    if not settings:
+        return
+    mat = settings.target_material
+    if not mat:
+        from ..animation.decals import get_active_decal_target
+        _, mat = get_active_decal_target(context)
+    if not mat:
+        return
+
+    from ..animation.decals import set_decal_transparency, keyframe_decal_transparency
+    alpha = (1.0 - max(0.0, min(1.0, self.transparency))) if settings.transparency_mode == 'ROBLOX' else self.transparency
+    set_decal_transparency(mat, self.name, alpha)
+
+    if settings.auto_keyframe:
+        keyframe_decal_transparency(
+            mat,
+            self.name,
+            frame=scene.frame_current,
+            interpolation=settings.interpolation,
+        )
+
+
+class RbxDecalItem(PropertyGroup):
+    name: bpy.props.StringProperty(name="Decal Name", default="Decal")
+    transparency: FloatProperty(
+        name="Transparency",
+        min=0.0,
+        max=1.0,
+        default=0.0,
+        update=_on_decal_transparency_update,
+    )
+    image_name: bpy.props.StringProperty(name="Image Name", default="")
+
+
+class RbxDecalSettings(PropertyGroup):
+    items: bpy.props.CollectionProperty(type=RbxDecalItem)
+    active_index: IntProperty(name="Active Index", default=0)
+    transparency_mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('ROBLOX', 'Roblox (0=Visible, 1=Hidden)', '0 is visible, 1 is invisible'),
+            ('BLENDER', 'Blender Alpha (1=Visible, 0=Hidden)', '1 is visible, 0 is invisible'),
+        ],
+        default='ROBLOX',
+    )
+    interpolation: EnumProperty(
+        name="Interpolation",
+        items=[
+            ('CONSTANT', 'Constant (Cut)', 'Instant frame change, best for facial expressions'),
+            ('LINEAR', 'Linear (Fade)', 'Linear cross-fade transition'),
+            ('BEZIER', 'Bézier (Smooth)', 'Smooth interpolation curve'),
+        ],
+        default='CONSTANT',
+    )
+    auto_keyframe: BoolProperty(
+        name="Auto Keyframe",
+        description="Insert keyframe on current frame automatically",
+        default=True,
+    )
+    target_object: bpy.props.PointerProperty(type=bpy.types.Object, name="Target Object")
+    target_material: bpy.props.PointerProperty(type=bpy.types.Material, name="Target Material")
+
+
 def register_properties():
     bpy.utils.register_class(RobloxFaceControlState)
     bpy.utils.register_class(RobloxAnimationSettings)
+    bpy.utils.register_class(RbxDecalItem)
+    bpy.utils.register_class(RbxDecalSettings)
     bpy.types.Scene.rbx_anim_settings = bpy.props.PointerProperty(
         type=RobloxAnimationSettings,
         name="Roblox Animations Settings",
+    )
+    bpy.types.Scene.rbx_decals = bpy.props.PointerProperty(
+        type=RbxDecalSettings,
+        name="Roblox Decals Settings",
     )
     bpy.types.Object.rbx_face_controls = bpy.props.PointerProperty(
         type=RobloxFaceControlState,
@@ -321,7 +395,11 @@ def unregister_properties():
         bpy.app.handlers.depsgraph_update_post.remove(_depsgraph_face_controls_handler)
     if hasattr(bpy.types.Object, "rbx_face_controls"):
         del bpy.types.Object.rbx_face_controls
+    if hasattr(bpy.types.Scene, "rbx_decals"):
+        del bpy.types.Scene.rbx_decals
     if hasattr(bpy.types.Scene, "rbx_anim_settings"):
         del bpy.types.Scene.rbx_anim_settings
+    bpy.utils.unregister_class(RbxDecalSettings)
+    bpy.utils.unregister_class(RbxDecalItem)
     bpy.utils.unregister_class(RobloxAnimationSettings)
     bpy.utils.unregister_class(RobloxFaceControlState)

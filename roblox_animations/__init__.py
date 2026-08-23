@@ -99,6 +99,14 @@ _classes = [
     # Server operators
     _resolve_operator_class("StartServerOperator"),
     _resolve_operator_class("StopServerOperator"),
+    # Decal operators
+    _resolve_operator_class("OBJECT_OT_RbxDecalScan", fallback_module="decal_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxDecalImportImages", fallback_module="decal_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxDecalSolo", fallback_module="decal_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxDecalQuickSwitch", fallback_module="decal_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxDecalKeyframe", fallback_module="decal_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxDecalClearKeyframes", fallback_module="decal_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxDecalExportScript", fallback_module="decal_ops"),
     # OAuth operators
     _resolve_operator_class("OBJECT_OT_RbxOAuthLogin", fallback_module="auth_ops"),
     _resolve_operator_class("OBJECT_OT_RbxOAuthCancelLogin", fallback_module="auth_ops"),
@@ -106,6 +114,7 @@ _classes = [
     # UI panels
     getattr(ui, "OBJECT_PT_RbxAnimations", None),
     getattr(ui, "OBJECT_PT_RbxAnimations_Tool", None),
+    getattr(ui, "OBJECT_PT_RbxDecals", None),
     # Addon preferences (must be last so bl_idname resolves correctly)
     RbxAnimationsPreferences,
 ]

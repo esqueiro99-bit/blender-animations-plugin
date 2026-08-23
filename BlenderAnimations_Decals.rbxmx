@@ -1,17 +1,936 @@
-<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime"
-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xsi:noNamespaceSchemaLocation="https://raw.githubusercontent.com/MaximumADHD/Roblox-File-Format/main/Roblox.xsd"
-        version="4">
-	<External>null</External>
-	<External>nil</External>
-	<Item class="Folder" referent="RBXB5D6B24BAE69">
-		<Properties>
-			<string name="Name">BlenderAnimationsInternal</string>
-		</Properties>
-		<Item class="Script" referent="RBXF404658693E4">
-			<Properties>
-				<string name="Name">BlenderAnimationsRefactored</string>
-				<ProtectedString name="Source"><![CDATA[
+<roblox version="4">
+  <Item class="Script" referent="0">
+    <Properties>
+      <string name="Name">BlenderAnimationsPlugin</string>
+      <token name="RunContext">0</token>
+      <string name="Source"><![CDATA[
+
+
+
+
+
+--!native
+--!strict
+--!optimize 2
+
+local internal = (script:FindFirstChild("state") and script)
+	or script:FindFirstChild("BlenderAnimationsInternal")
+	or (script.Parent and script.Parent:FindFirstChild("state") and script.Parent)
+	or (script.Parent and script.Parent:FindFirstChild("BlenderAnimationsInternal"))
+	or script
+
+local State = require(internal.state)
+local Types = require(internal.types)
+local PlaybackService = require(internal.Services.PlaybackService)
+
+
+-- Import our new services
+local RigManager = require(internal.Services.RigManager)
+local AnimationManager = require(internal.Services.AnimationManager)
+local BlenderSyncManager = require(internal.Services.BlenderSyncManager)
+local ExportManager = require(internal.Services.ExportManager)
+local CameraManager = require(internal.Services.CameraManager)
+
+-- Import UI components
+local PlayerTab = require(internal.UI.Tabs.PlayerTab)
+local RiggingTab = require(internal.UI.Tabs.RiggingTab)
+local ToolsTab = require(internal.UI.Tabs.ToolsTab)
+local MoreTab = require(internal.UI.Tabs.MoreTab)
+local SharedComponents = require(internal.UI.SharedComponents)
+
+local Plugin = plugin
+
+local Components = internal.Components
+local Packages = internal.Packages
+
+local PluginComponents = Components:FindFirstChild("PluginComponents")
+local Widget = require(PluginComponents.Widget)
+local Toolbar = require(PluginComponents.Toolbar)
+local ToolbarButton = require(PluginComponents.ToolbarButton)
+local Selection = game:GetService("Selection")
+local UserInputService = game:GetService("UserInputService")
+local StudioComponents = Components:FindFirstChild("StudioComponents")
+
+
+local ScrollFrame = require(StudioComponents.ScrollFrame)
+local Button = require(StudioComponents.Button)
+local Label = require(StudioComponents.Label)
+local Loading = require(StudioComponents.Loading)
+local TextInput = require(StudioComponents.TextInput)
+local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
+
+local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
+local themeProvider = require(StudioComponentsUtil.themeProvider)
+
+local Fusion = require(Packages.Fusion)
+
+local New = Fusion.New
+local Children = Fusion.Children
+local OnEvent = Fusion.OnEvent
+local Value = Fusion.Value
+local Computed = Fusion.Computed
+local Observer = Fusion.Observer
+
+local GLOBAL_HEADER_HEIGHT = 108
+
+-- Initialize services
+local playbackService = PlaybackService.new(State, Types) :: any
+local cameraManager = CameraManager.new()
+local rigManager = RigManager.new(playbackService, cameraManager)
+local animationManager = AnimationManager.new(playbackService, Plugin)
+local exportManager = ExportManager.new()
+local blenderSyncManager = BlenderSyncManager.new(playbackService, animationManager)
+
+
+State.rigManager = rigManager
+
+-- Create services object for passing to UI components
+local services = {
+	playbackService = playbackService,
+	rigManager = rigManager,
+	animationManager = animationManager,
+	exportManager = exportManager,
+	cameraManager = cameraManager,
+	blenderSyncManager = blenderSyncManager,
+	plugin = Plugin,
+}
+
+local function importAnimationFromClipboard()
+	if not State.enableClipboardExport:get() then
+		warn("Clipboard import is disabled in Settings.")
+		return
+	end
+	if not State.activeRigExists:get() then
+		warn("No active rig selected.")
+		return
+	end
+
+	services.playbackService:stopAnimationAndDisconnect()
+	local importScriptText = "Paste the animation data below this line"
+
+	services.exportManager:clearMetaParts()
+	if State.importScript then
+		State.importScript:Destroy()
+	end
+	State.importScript = Instance.new("Script", game.Workspace)
+	assert(State.importScript)
+	State.importScript.Archivable = false
+	State.importScript.Source = "-- " .. importScriptText .. "\n"
+	Plugin:OpenScript(State.importScript, 2)
+	local tempConnection: RBXScriptConnection
+	tempConnection = State.importScript.Changed:Connect(function(prop)
+		if prop == "Source" then
+			tempConnection:Disconnect()
+			if State.importScript then
+				local animData = select(
+					3,
+					string.find(
+						State.importScript.Source,
+						"^%-%- " .. importScriptText .. "\n(.*)$"
+					)
+				)
+				State.importScript:Destroy()
+				State.importScript = nil
+				if animData then
+					services.animationManager:loadAnimDataFromText(animData, false)
+				end
+			end
+		end
+	end)
+end
+
+local function cleanupAll()
+	-- 1. Stop running processes (synchronously so it finishes before unload)
+	playbackService:stopAnimationAndDisconnect( { background = false } )
+	
+	blenderSyncManager:cleanup()
+
+	-- 2. Disconnect UI-related connections
+	cameraManager:cleanup()
+
+	-- 4. Reset state variables
+	State.loadingEnabled:set(false)
+	State.loadingTitle:set("Working")
+	State.loadingStatus:set("Please wait...")
+	State.loadingDetail:set("")
+	State.loadingProgress:set(0)
+	State.loadingCanEstimate:set(false)
+	State.rigModelName:set("No Rig Selected")
+	State.keyframeStats:set({ count = 0, totalDuration = 0 })
+	State.playhead:set(0)
+	State.keyframeNames:set({})
+	State.savedAnimations:set({})
+	State.selectedSavedAnim:set(nil)
+	State.activeRigModel = nil
+	State.activeAnimator = nil
+	State.activeRig = nil
+	State.currentKeyframeSequence = nil
+	State.isPlaying:set(false)
+	State.isReversed:set(false)
+	State.animationData = nil
+	State.isSelectionLocked:set(false)
+	State.activeRigExists:set(false)
+	State.isFinished:set(false)
+	rigManager:clearWarnings()
+end
+
+
+local function cleanupRigSelection()
+	-- This function is a subset of cleanupAll, intended for when a rig is deselected.
+	-- It resets rig-specific state without killing the Blender connection.
+	playbackService:stopAnimationAndDisconnect( { background = false } )
+
+	-- Reset state variables related to the rig
+	State.loadingEnabled:set(false)
+	State.loadingTitle:set("Working")
+	State.loadingStatus:set("Please wait...")
+	State.loadingDetail:set("")
+	State.loadingProgress:set(0)
+	State.loadingCanEstimate:set(false)
+	State.rigModelName:set("No Rig Selected")
+	State.keyframeStats:set({ count = 0, totalDuration = 0 })
+	State.playhead:set(0)
+	State.keyframeNames:set({})
+	State.savedAnimations:set({})
+	State.selectedSavedAnim:set(nil)
+	State.activeRigModel = nil
+	State.activeAnimator = nil
+	State.activeRig = nil
+	State.currentKeyframeSequence = nil
+	State.isPlaying:set(false)
+	State.isReversed:set(false)
+	State.animationData = nil
+	State.activeRigExists:set(false)
+	State.isFinished:set(false)
+	rigManager:clearWarnings()
+end
+
+-- Function to update the active rig based on the current selection in Studio
+local function updateActiveRigFromSelection()
+	if State.widgetsEnabled:get(true) and not State.isSelectionLocked:get() then
+		local selectedRig = false
+		local selection = Selection:Get()
+		if #selection > 0 and not selectedRig then
+			local selectedObject = selection[1] -- Consider the first object in the selection
+
+			if rigManager:isKeyframeSequence(selectedObject) then
+				-- Set the flag if a KeyframeSequence is selected and do nothing
+				State.lastSelectionWasKeyframeSequence = true
+				return
+			end
+
+			if rigManager:isValidRig(selectedObject) then
+				if State.lastSelectionWasKeyframeSequence then
+					-- If the last selection was a KeyframeSequence, do not update the rig
+					State.lastSelectionWasKeyframeSequence = false
+					return
+				end
+
+				if State.activeRigModel ~= selectedObject then
+					-- Proceed to set the rig only if it is valid, not a KeyframeSequence, and different from the current rig
+					State.animationLength:set(0)
+					State.animationData = nil
+					State.activeRigExists:set(true)
+					rigManager:clearWarnings()
+					State.loadingEnabled:set(true) -- Enable loading indicator
+					State.activeRigModel = selectedObject
+					State.activeRig = nil
+					task.spawn(function()
+						rigManager:setRig(selectedObject)
+					end)
+				end
+				selectedRig = true
+			else
+				cleanupRigSelection()
+			end
+		elseif #selection == 0 then
+			State.lastSelectionWasKeyframeSequence = false
+			if State.activeRigModel then
+				cleanupRigSelection()
+			end
+		end
+	end
+end
+
+-- Start live sync if enabled when an armature is selected
+table.insert(
+	State.observers,
+	Observer(State.selectedArmature):onChange(function()
+		if State.selectedArmature:get() and State.liveSyncEnabled:get() then
+			blenderSyncManager:startLiveSyncing()
+		end
+	end)
+)
+
+-- Prevent autoconnect from continuously retrying on state changes
+local autoConnectAttemptedThisSession = false
+table.insert(
+	State.observers,
+	Observer(State.autoConnectToBlender):onChange(function()
+		if State.autoConnectToBlender:get() and not autoConnectAttemptedThisSession then
+			-- Only allow autoconnect to attempt once per session to prevent continuous retries
+			autoConnectAttemptedThisSession = true
+			blenderSyncManager.autoConnectAttempts = 0 -- Reset for manual attempt
+			task.spawn(function()
+				task.wait(0.5)
+				if blenderSyncManager.autoConnectAttempts < blenderSyncManager.maxAutoConnectAttempts then
+					blenderSyncManager.autoConnectAttempts = (blenderSyncManager.autoConnectAttempts or 0) + 1
+					blenderSyncManager:toggleServerConnection()
+				end
+			end)
+		end
+	end)
+)
+
+do -- Creates the plugin
+	local pluginToolbar = Toolbar({
+		Plugin = Plugin,
+		Name = "Blender Animations",
+	})
+
+	local importClipboardAction = Plugin:CreatePluginAction(
+		"BlenderAnimations_ImportClipboard",
+		"Import Animation (Clipboard)",
+		"Import animation data from clipboard",
+		""
+	)
+
+	table.insert(
+		State.connections,
+		importClipboardAction.Triggered:Connect(function()
+			State.activeTab:set("Player")
+			importAnimationFromClipboard()
+		end)
+	)
+
+	State.widgetsEnabled = Value(false)
+	State.helpWidgetEnabled = Value(false)
+	
+	local DECAL_PLUGIN_LOGO = "rbxasset://textures/AnimationEditor/TimelineButton.png"
+	State.toolbarButtonImage:set(DECAL_PLUGIN_LOGO)
+	
+	local enableButton = ToolbarButton({
+		Plugin = Plugin,
+		Toolbar = pluginToolbar,
+		ClickableWhenViewportHidden = true,
+		Name = "Open",
+		ToolTip = "Open Blender Animations Plugin",
+		Image = DECAL_PLUGIN_LOGO,
+	})
+	
+	local helpButton = ToolbarButton({
+		Plugin = Plugin,
+		Toolbar = pluginToolbar,
+		ClickableWhenViewportHidden = true,
+		Name = "READ!!!",
+		ToolTip = "Open Help Widget",
+		Image = "rbxassetid://112326668147130",
+	})
+
+
+
+	-- Handle plugin unloading
+	Plugin.Unloading:Connect(function()
+		-- Disconnect observers first to prevent them from firing during cleanup
+		for _, obs in ipairs(State.observers) do
+			obs()
+		end
+		table.clear(State.observers)
+
+		-- Run cleanup synchronously to ensure stopAnimationAndDisconnect finishes before unload
+		cleanupAll()
+
+		if State.selectionConnection then
+			State.selectionConnection:Disconnect()
+			State.selectionConnection = nil
+		end
+
+		for _, conn in ipairs(State.connections) do
+			conn:Disconnect()
+		end
+		table.clear(State.connections)
+	end)
+
+	-- Handle widget enabled/disabled
+	table.insert(
+		State.observers,
+		(Observer(State.widgetsEnabled :: any) :: any):onChange(function(isEnabled: boolean)
+				if enableButton and enableButton.Parent then
+					enableButton:SetActive(isEnabled)
+				end
+				if isEnabled then
+					updateActiveRigFromSelection()
+				end
+				return nil
+			end) :: any
+	)
+	
+	-- Handle help widget enabled/disabled
+	table.insert(
+		State.observers,
+		(Observer(State.helpWidgetEnabled :: any) :: any):onChange(function(isEnabled: boolean)
+				if helpButton and helpButton.Parent then
+					helpButton:SetActive(isEnabled)
+				end
+				return nil
+			end) :: any
+	)
+
+	-- Load saved settings
+    local savedDockSide = plugin:GetSetting("DockSide")
+	if savedDockSide and typeof(savedDockSide) == "EnumItem" then
+		State.dockSide:set(savedDockSide)
+	end
+
+    -- merge saved tab order with defaults (forward-compatible)
+    do
+        local defaults = { "Player", "Rigging", "Tools", "More" }
+        local defaultSet = {}
+        for _, name in ipairs(defaults) do defaultSet[name] = true end
+
+        local saved = plugin:GetSetting("TabOrder")
+        local merged = {}
+        local seen = {}
+
+        if typeof(saved) == "table" then
+            for _, name in ipairs(saved) do
+                if defaultSet[name] and not seen[name] then
+                    table.insert(merged, name)
+                    seen[name] = true
+                end
+            end
+        end
+
+        for _, name in ipairs(defaults) do
+            if not seen[name] then
+                table.insert(merged, name)
+            end
+        end
+
+        State.tabs:set(merged)
+    end
+
+    -- load persisted settings (tools/settings toggles)
+    local ef = plugin:GetSetting("EnableFileExport")
+    if typeof(ef) == "boolean" then
+        State.enableFileExport:set(ef)
+    else
+        State.enableFileExport:set(true)
+    end
+    local ec = plugin:GetSetting("EnableClipboardExport")
+    if typeof(ec) == "boolean" then
+        State.enableClipboardExport:set(ec)
+    else
+        State.enableClipboardExport:set(true)
+    end
+    local els = plugin:GetSetting("EnableLiveSync")
+    if typeof(els) == "boolean" then State.enableLiveSync:set(els) end
+    local ac = plugin:GetSetting("AutoConnectToBlender")
+    if typeof(ac) == "boolean" then State.autoConnectToBlender:set(ac) end
+	local rm = plugin:GetSetting("ReducedMotion")
+	if typeof(rm) == "boolean" then State.reducedMotion:set(rm) end
+    local sd = plugin:GetSetting("ShowDebugInfo")
+    if typeof(sd) == "boolean" then State.showDebugInfo:set(sd) end
+    
+    -- Auto-connect to Blender if enabled
+    if State.autoConnectToBlender:get() then
+        task.spawn(function()
+            task.wait(1) -- Wait a bit for everything to initialize
+            -- Add safeguard to prevent continuous retry attempts
+            blenderSyncManager.autoConnectAttempts = (blenderSyncManager.autoConnectAttempts or 0) + 1
+            if blenderSyncManager.autoConnectAttempts > blenderSyncManager.maxAutoConnectAttempts then
+                warn("Auto-connect to Blender failed after " .. blenderSyncManager.maxAutoConnectAttempts .. " attempts. Giving up.")
+                return
+            end
+            blenderSyncManager:toggleServerConnection()
+        end)
+    end
+
+	-- Create tabs UI
+	local function createTabsUI()
+		return New("Frame")({
+			Size = UDim2.new(0, 40, 1, 0),
+			Position = Computed(function()
+				return if State.dockSide:get() == Enum.InitialDockState.Left
+					then UDim2.fromOffset(0, 0)
+					else UDim2.new(1, -40, 0, 0)
+			end),
+			BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainBackground),
+			[Children] = {
+				New("ScrollingFrame")({
+					Size = UDim2.new(1, 0, 1, 0),
+					BackgroundTransparency = 1,
+					CanvasSize = UDim2.new(0, 0, 0, 0),
+					AutomaticCanvasSize = Enum.AutomaticSize.Y,
+					ScrollBarThickness = 4,
+					ScrollBarImageTransparency = 0.5,
+					[Children] = {
+						New("UIListLayout")({
+							FillDirection = Enum.FillDirection.Vertical,
+							SortOrder = Enum.SortOrder.LayoutOrder,
+							Padding = UDim.new(0, 4),
+							HorizontalAlignment = Enum.HorizontalAlignment.Center,
+						}),
+						New("UIPadding")({
+							PaddingTop = UDim.new(0, 10),
+							PaddingBottom = UDim.new(0, 5),
+						}),
+
+						[Children :: any] = Computed(function()
+							local tabButtons: {any} = {}
+
+							local function DropIndicator(index: number)
+								return New("Frame")({
+									Size = UDim2.new(1, 0, 0, 4),
+									BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText),
+									BorderSizePixel = 0,
+									LayoutOrder = index - 1,
+									Visible = Computed(function()
+										return State.dropIndex:get() == index
+									end),
+								})
+							end
+
+							for i, tabName in ipairs(State.tabs:get()) do
+								table.insert(tabButtons, DropIndicator(i))
+								table.insert(
+									tabButtons,
+									New("Frame")({
+										LayoutOrder = i,
+										Size = UDim2.new(1, 0, 0, 128),
+										BackgroundTransparency = 1,
+										[Children] = {
+											Button({
+												Text = tabName,
+											Size = UDim2.new(0, 128, 0, 22),
+												Position = UDim2.fromScale(0.5, 0.5),
+												AnchorPoint = Vector2.new(0.5, 0.5),
+												Rotation = Computed(function()
+													return if State.dockSide:get() == Enum.InitialDockState.Left then 90 else -90
+												end),
+												BackgroundColorStyle = Computed(function()
+													if State.activeTab:get() == tabName then
+														return Enum.StudioStyleGuideColor.DiffFilePathBackground
+													else
+														return Enum.StudioStyleGuideColor.Button
+													end
+												end),
+												[OnEvent("InputBegan")] = function(input)
+													if input and input.UserInputType == Enum.UserInputType.MouseButton1 then
+														State.activeTab:set(tabName)
+														State.draggedTab:set(tabName)
+													end
+												end,
+												[OnEvent("InputEnded")] = function(input)
+													if input and input.UserInputType == Enum.UserInputType.MouseButton1 then
+														local dropIndexValue = State.dropIndex:get()
+														if State.draggedTab:get() and dropIndexValue then
+															local tabs = State.tabs:get()
+															local dragIndex
+															for i, t in ipairs(tabs) do
+																if t == State.draggedTab:get() then
+																	dragIndex = i
+																	break
+																end
+															end
+															if dragIndex then
+																local droppedTab = table.remove(tabs, dragIndex)
+																local dropIndex = dropIndexValue
+																if dragIndex < dropIndex then
+																	dropIndex = dropIndex - 1
+																end
+																table.insert(tabs, dropIndex, droppedTab)
+																State.tabs:set(tabs)
+																plugin:SetSetting("TabOrder", tabs)
+															end
+														end
+														State.draggedTab:set(nil)
+														State.dropIndex:set(nil)
+													end
+												end,
+											}) :: any,
+											New("Frame")({
+												Size = UDim2.fromScale(1, 1),
+												BackgroundTransparency = 1,
+												ZIndex = 2,
+												[OnEvent("MouseEnter")] = function()
+													if State.draggedTab:get() and State.draggedTab:get() ~= tabName then
+														State.dropIndex:set(i)
+													end
+												end,
+												[OnEvent("MouseLeave")] = function()
+													if State.dropIndex:get() == i then
+														State.dropIndex:set(nil)
+													end
+												end,
+											}),
+										},
+									})
+								)
+							end
+							table.insert(tabButtons, DropIndicator(#State.tabs:get() + 1))
+
+							table.insert(
+								tabButtons,
+								New("Frame")({
+									LayoutOrder = #State.tabs:get() + 2,
+									Size = UDim2.new(1, 0, 0, 40),
+									BackgroundTransparency = 1,
+									[Children] = {
+										Button({
+											Text = "⇩",
+											Size = UDim2.new(0, 40, 0, 22),
+											Position = UDim2.fromScale(0.5, 0.5),
+											AnchorPoint = Vector2.new(0.5, 0.5),
+											Rotation = Computed(function()
+												return if State.dockSide:get() == Enum.InitialDockState.Left then -90 else 90
+											end),
+											Activated = function()
+												local newSide
+												if State.dockSide:get() == Enum.InitialDockState.Left then
+													newSide = Enum.InitialDockState.Right
+												else
+													newSide = Enum.InitialDockState.Left
+												end
+												State.dockSide:set(newSide)
+												plugin:SetSetting("DockSide", newSide)
+											end,
+											BackgroundColorStyle = Enum.StudioStyleGuideColor.Button,
+										}) :: any,
+									},
+								})
+							)
+							return tabButtons
+						end, Fusion.cleanup) :: any,
+					},
+				}),
+			},
+		})
+	end
+
+	local function safeCreateTab(tabName: string, tabModule: any)
+		local ok, content = pcall(function()
+			return tabModule.create(services)
+		end)
+		if ok and content then
+			return content
+		else
+			warn("[BlenderAnimations] Erro ao carregar aba " .. tabName .. ": " .. tostring(content))
+			return {
+				New("TextLabel")({
+					Text = "Erro ao carregar aba " .. tabName .. ": " .. tostring(content),
+					Size = UDim2.new(1, 0, 0, 60),
+					TextColor3 = Color3.fromRGB(255, 100, 100),
+					BackgroundTransparency = 1,
+					TextWrapped = true,
+				})
+			}
+		end
+	end
+
+	-- Build tab content once to avoid re-parent churn on tab switches
+	local tabContent = {
+		Player = safeCreateTab("Player", PlayerTab),
+		Rigging = safeCreateTab("Rigging", RiggingTab),
+		Tools = safeCreateTab("Tools", ToolsTab),
+		More = safeCreateTab("More", MoreTab),
+	}
+
+
+	local function makeTabFrame(tabName: string, children)
+		local tabChildren = {
+			_UIListLayout = New("UIListLayout")({
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 7),
+			}),
+			_UIPadding = New("UIPadding")({
+				PaddingLeft = UDim.new(0, 5),
+				PaddingRight = UDim.new(0, 14),
+				PaddingBottom = UDim.new(0, 10),
+				PaddingTop = UDim.new(0, 10),
+			}),
+		}
+		for i, child in ipairs(children) do
+			tabChildren["child" .. i] = child
+		end
+		return New("Frame")({
+			Name = tabName .. "Tab",
+			BackgroundTransparency = 1,
+			Size = Computed(function()
+				return if State.activeTab:get() == tabName
+					then UDim2.new(1, 0, 0, 0)
+					else UDim2.new(1, 0, 0, 0)
+			end),
+			AutomaticSize = Computed(function()
+				return if State.activeTab:get() == tabName
+					then Enum.AutomaticSize.Y
+					else Enum.AutomaticSize.None
+			end),
+			Visible = Computed(function()
+				return State.activeTab:get() == tabName
+			end),
+			[Children] = tabChildren,
+		})
+	end
+
+	local tabFrames = {
+		_PlayerTab = makeTabFrame("Player", tabContent.Player),
+		_RiggingTab = makeTabFrame("Rigging", tabContent.Rigging),
+		_ToolsTab = makeTabFrame("Tools", tabContent.Tools),
+		_MoreTab = makeTabFrame("More", tabContent.More),
+	}
+
+	local function handleMainWidgetEnabledChanged(isEnabled: boolean)
+		if not isEnabled then
+			cleanupAll()
+		end
+		if State.widgetsEnabled:get() ~= isEnabled then
+			(State.widgetsEnabled :: any):set(isEnabled)
+		end
+		if isEnabled then
+			updateActiveRigFromSelection()
+		end
+	end
+
+	local function handleHelpWidgetEnabledChanged(isEnabled: boolean)
+		if State.helpWidgetEnabled:get() ~= isEnabled then
+			(State.helpWidgetEnabled :: any):set(isEnabled)
+		end
+	end
+
+	-- Create the main widget
+	local function pluginWidget()
+		return Widget({
+			Plugin = Plugin,
+			Id = "BlenderAnimationsMain",
+			Name = "Blender Animations",
+			InitialDockTo = State.dockSide:get(),
+			InitialEnabled = false,
+			ForceInitialEnabled = false,
+			FloatingSize = Vector2.new(250, 600),
+			MinimumSize = Vector2.new(250, 600),
+			Enabled = State.widgetsEnabled,
+			[Children] = New("Frame")({
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				[Children] = {
+					createTabsUI(),
+					New("Frame")({
+						Name = "GlobalHeader",
+						ZIndex = 1,
+						Size = UDim2.new(1, -40, 0, GLOBAL_HEADER_HEIGHT),
+						Position = Computed(function()
+							return if State.dockSide:get() == Enum.InitialDockState.Left
+								then UDim2.fromOffset(40, 0)
+								else UDim2.fromOffset(0, 0)
+						end),
+						BackgroundTransparency = 1,
+						[Children] = {
+							SharedComponents.createHeaderUI(services),
+							New("Frame")({
+								Name = "HeaderDivider",
+								AnchorPoint = Vector2.new(0, 1),
+								Position = UDim2.new(0, 0, 1, 0),
+								Size = UDim2.new(1, 0, 0, 1),
+								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Border),
+								BorderSizePixel = 0,
+							}),
+						},
+					}),
+					ScrollFrame({
+						ZIndex = 1,
+						Size = UDim2.new(1, -40, 1, -GLOBAL_HEADER_HEIGHT),
+						Position = Computed(function()
+							return if State.dockSide:get() == Enum.InitialDockState.Left
+								then UDim2.fromOffset(40, GLOBAL_HEADER_HEIGHT)
+								else UDim2.fromOffset(0, GLOBAL_HEADER_HEIGHT)
+						end),
+						BackgroundTransparency = 1,
+						AutomaticCanvasSize = Enum.AutomaticSize.Y,
+						[Children] = {
+							_PlayerTab = tabFrames._PlayerTab,
+							_RiggingTab = tabFrames._RiggingTab,
+							_ToolsTab = tabFrames._ToolsTab,
+							_MoreTab = tabFrames._MoreTab,
+						},
+					}),
+					Loading({
+						Enabled = State.loadingEnabled,
+						Title = State.loadingTitle,
+						Status = State.loadingStatus,
+						Detail = State.loadingDetail,
+						Progress = State.loadingProgress,
+						CanEstimate = State.loadingCanEstimate,
+					}),
+			},
+			}),
+		})
+	end
+
+	-- Create the main widget with tab content
+	local mainWidget = pluginWidget()
+	print("[DEBUG-DECAL] mainWidget inicializado. Estado inicial Enabled = " .. tostring(mainWidget.Enabled))
+
+	table.insert(State.connections, mainWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		print("[DEBUG-DECAL] mainWidget.Enabled mudou para: " .. tostring(mainWidget.Enabled))
+		handleMainWidgetEnabledChanged(mainWidget.Enabled)
+		enableButton:SetActive(mainWidget.Enabled)
+	end))
+	mainWidget:BindToClose(function()
+		print("[DEBUG-DECAL] mainWidget fechado pelo usuario.")
+		handleMainWidgetEnabledChanged(false)
+		enableButton:SetActive(false)
+	end)
+
+	table.insert(State.connections, enableButton.Click:Connect(function()
+		local nextState = not mainWidget.Enabled
+		print("[DEBUG-DECAL] >>> Clique no botao 'Blender (Decals)' detectado! <<<")
+		print("[DEBUG-DECAL] Alternando visibilidade de " .. tostring(mainWidget.Enabled) .. " para " .. tostring(nextState))
+		mainWidget.Enabled = nextState
+		handleMainWidgetEnabledChanged(nextState)
+		enableButton:SetActive(nextState)
+	end))
+
+
+	
+	-- Create the help widget
+	local helpWidget = Widget({
+		Plugin = Plugin,
+		Id = "BlenderAnimationsHelp",
+		Name = "IMPORTANT READ ME!!!",
+		InitialDockTo = Enum.InitialDockState.Float,
+		InitialEnabled = false,
+		ForceInitialEnabled = false,
+		FloatingSize = Vector2.new(400, 500),
+		MinimumSize = Vector2.new(400, 500),
+		Enabled = State.helpWidgetEnabled,
+		[Children] = {
+			New("UIPadding")({
+				PaddingLeft = UDim.new(0, 10),
+				PaddingRight = UDim.new(0, 10),
+				PaddingTop = UDim.new(0, 16),
+				PaddingBottom = UDim.new(0, 16),
+			}),
+			New("UIListLayout")({
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 8),
+			}),
+			VerticalCollapsibleSection({
+				Text = "MAJOR UPDATE AVAILABLE!",
+				Collapsed = false,
+				LayoutOrder = 2,
+				[Children] = {
+					New("Frame")({
+						Size = UDim2.new(1, 0, 0, 64),
+						BackgroundTransparency = 1,
+						LayoutOrder = 1,
+						[Children] = {
+							New("ImageLabel")({
+								Size = UDim2.new(0, 64, 0, 64),
+								Position = UDim2.new(0.5, 0, 0.5, 0),
+								AnchorPoint = Vector2.new(0.5, 0.5),
+								BackgroundTransparency = 1,
+								Image = "rbxassetid://92189642379919",
+							}),
+						},
+					}),
+					Label({
+						LayoutOrder = 1,
+						Text = "Please download the new Blender addon from Blender or Github to use this plugin. There has been a major update as you can probably tell. It is way more stable, fixes nearly all of the previous bugs, and has a lot of new features you will enjoy. This addon will continue to be free forever. I strongly recommend you update, and I hope you like the new logo. If you still wish to use clipboard and file export, you can still do so by enabling them in the More tab, HOWEVER the Server Sync has additional features that you would really miss out on. Also the new addon supports up to Blender 5.0+, godspeed my fellow animators. \n\n —Cautioned",
+						TextWrapped = true,
+					}),
+					TextInput({
+						LayoutOrder = 2,
+						Text = "https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/",
+					}),
+					TextInput({
+						LayoutOrder = 3,
+						Text = "https://github.com/Cautioned/Blender-Animations-Plugin/releases",
+					}),
+					TextInput({
+						LayoutOrder = 4,
+						Text = "Copy and paste the URL into your browser to download the addon.",
+					}),
+				},
+			}),
+		},
+	})
+	table.insert(State.connections, helpWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		handleHelpWidgetEnabledChanged(helpWidget.Enabled)
+		helpButton:SetActive(helpWidget.Enabled)
+	end))
+	helpWidget:BindToClose(function()
+		handleHelpWidgetEnabledChanged(false)
+		helpButton:SetActive(false)
+	end)
+
+	table.insert(State.connections, helpButton.Click:Connect(function()
+		local nextState = not helpWidget.Enabled
+		helpWidget.Enabled = nextState
+		handleHelpWidgetEnabledChanged(nextState)
+		helpButton:SetActive(nextState)
+	end))
+end
+
+
+if not State.selectionConnection or not State.selectionConnection.Connected then
+	State.selectionConnection = Selection.SelectionChanged:Connect(updateActiveRigFromSelection)
+end
+
+-- Tab hotkey (Tab / Shift+Tab) to cycle tabs
+table.insert(
+	State.connections,
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if not State.widgetsEnabled:get() then
+			return
+		end
+		if UserInputService:GetFocusedTextBox() then
+			return
+		end
+		if input.KeyCode ~= Enum.KeyCode.Tab then
+			return
+		end
+
+		local tabs = State.tabs:get()
+		if #tabs == 0 then
+			return
+		end
+		local current = State.activeTab:get()
+		local currentIndex = 1
+		for i, t in ipairs(tabs) do
+			if t == current then
+				currentIndex = i
+				break
+			end
+		end
+		local isShift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+		local step = isShift and -1 or 1
+		local nextIndex = currentIndex + step
+		if nextIndex > #tabs then
+			nextIndex = 1
+		elseif nextIndex < 1 then
+			nextIndex = #tabs
+		end
+		State.activeTab:set(tabs[nextIndex])
+	end)
+)
+
+print("[BlenderAnimations Decals] Plugin inicializado com sucesso! Pronto para uso.")
+
+
+
+
+]]></string>
+    </Properties>
+    <Item class="Script" referent="1">
+      <Properties>
+        <string name="Name">BlenderAnimationsRefactored</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[
 
 
 
@@ -312,19 +1231,8 @@ do -- Creates the plugin
 	State.widgetsEnabled = Value(false)
 	State.helpWidgetEnabled = Value(false)
 	
-	-- Update image based on current theme using themeProvider like PlaybackControls
-	local function updateToolbarImage()
-		local testColor = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainBackground)
-		-- Dark theme has darker background colors
-		if testColor and testColor.R and testColor.G and testColor.B and testColor.R < 0.2 and testColor.G < 0.2 and testColor.B < 0.2 then
-			State.toolbarButtonImage:set("rbxassetid://116041192227009") -- dark theme
-		else
-			State.toolbarButtonImage:set("rbxassetid://92189642379919") -- light theme
-		end
-	end
-	
-	-- Initial update
-	updateToolbarImage()
+	local DECAL_PLUGIN_LOGO = "rbxasset://textures/AnimationEditor/TimelineButton.png"
+	State.toolbarButtonImage:set(DECAL_PLUGIN_LOGO)
 	
 	local enableButton = ToolbarButton({
 		Plugin = Plugin,
@@ -332,11 +1240,7 @@ do -- Creates the plugin
 		ClickableWhenViewportHidden = true,
 		Name = "Open",
 		ToolTip = "Open Blender Animations Plugin",
-		Image = State.toolbarButtonImage:get(),
-
-		[OnEvent("Click")] = function()
-			(State.widgetsEnabled :: any):set(not (State.widgetsEnabled :: any):get())
-		end,
+		Image = DECAL_PLUGIN_LOGO,
 	})
 	
 	local helpButton = ToolbarButton({
@@ -346,20 +1250,9 @@ do -- Creates the plugin
 		Name = "READ!!!",
 		ToolTip = "Open Help Widget",
 		Image = "rbxassetid://112326668147130",
-
-		[OnEvent("Click")] = function()
-			(State.helpWidgetEnabled :: any):set(not (State.helpWidgetEnabled :: any):get())
-		end,
 	})
-	
-	-- Add observer for toolbar button image changes
-	table.insert(State.observers, Observer(State.toolbarButtonImage):onChange(function()
-		if enableButton and enableButton.Parent then
-			pcall(function()
-				enableButton.Image = State.toolbarButtonImage:get()
-			end)
-		end
-	end))
+
+
 
 	-- Handle plugin unloading
 	Plugin.Unloading:Connect(function()
@@ -640,13 +1533,34 @@ do -- Creates the plugin
 		})
 	end
 
+	local function safeCreateTab(tabName: string, tabModule: any)
+		local ok, content = pcall(function()
+			return tabModule.create(services)
+		end)
+		if ok and content then
+			return content
+		else
+			warn("[BlenderAnimations] Erro ao carregar aba " .. tabName .. ": " .. tostring(content))
+			return {
+				New("TextLabel")({
+					Text = "Erro ao carregar aba " .. tabName .. ": " .. tostring(content),
+					Size = UDim2.new(1, 0, 0, 60),
+					TextColor3 = Color3.fromRGB(255, 100, 100),
+					BackgroundTransparency = 1,
+					TextWrapped = true,
+				})
+			}
+		end
+	end
+
 	-- Build tab content once to avoid re-parent churn on tab switches
 	local tabContent = {
-		Player = PlayerTab.create(services),
-		Rigging = RiggingTab.create(services),
-		Tools = ToolsTab.create(services),
-		More = MoreTab.create(services),
+		Player = safeCreateTab("Player", PlayerTab),
+		Rigging = safeCreateTab("Rigging", RiggingTab),
+		Tools = safeCreateTab("Tools", ToolsTab),
+		More = safeCreateTab("More", MoreTab),
 	}
+
 
 	local function makeTabFrame(tabName: string, children)
 		local tabChildren = {
@@ -780,12 +1694,29 @@ do -- Creates the plugin
 
 	-- Create the main widget with tab content
 	local mainWidget = pluginWidget()
+	print("[DEBUG-DECAL] mainWidget inicializado. Estado inicial Enabled = " .. tostring(mainWidget.Enabled))
+
 	table.insert(State.connections, mainWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		print("[DEBUG-DECAL] mainWidget.Enabled mudou para: " .. tostring(mainWidget.Enabled))
 		handleMainWidgetEnabledChanged(mainWidget.Enabled)
+		enableButton:SetActive(mainWidget.Enabled)
 	end))
 	mainWidget:BindToClose(function()
+		print("[DEBUG-DECAL] mainWidget fechado pelo usuario.")
 		handleMainWidgetEnabledChanged(false)
+		enableButton:SetActive(false)
 	end)
+
+	table.insert(State.connections, enableButton.Click:Connect(function()
+		local nextState = not mainWidget.Enabled
+		print("[DEBUG-DECAL] >>> Clique no botao 'Blender (Decals)' detectado! <<<")
+		print("[DEBUG-DECAL] Alternando visibilidade de " .. tostring(mainWidget.Enabled) .. " para " .. tostring(nextState))
+		mainWidget.Enabled = nextState
+		handleMainWidgetEnabledChanged(nextState)
+		enableButton:SetActive(nextState)
+	end))
+
+
 	
 	-- Create the help widget
 	local helpWidget = Widget({
@@ -851,11 +1782,21 @@ do -- Creates the plugin
 	})
 	table.insert(State.connections, helpWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
 		handleHelpWidgetEnabledChanged(helpWidget.Enabled)
+		helpButton:SetActive(helpWidget.Enabled)
 	end))
 	helpWidget:BindToClose(function()
 		handleHelpWidgetEnabledChanged(false)
+		helpButton:SetActive(false)
 	end)
+
+	table.insert(State.connections, helpButton.Click:Connect(function()
+		local nextState = not helpWidget.Enabled
+		helpWidget.Enabled = nextState
+		handleHelpWidgetEnabledChanged(nextState)
+		helpButton:SetActive(nextState)
+	end))
 end
+
 
 if not State.selectionConnection or not State.selectionConnection.Connected then
 	State.selectionConnection = Selection.SelectionChanged:Connect(updateActiveRigFromSelection)
@@ -903,20 +1844,22 @@ table.insert(
 	end)
 )
 
+print("[BlenderAnimations Decals] Plugin inicializado com sucesso! Pronto para uso.")
 
 
-]]></ProtectedString>
-				<bool name="Disabled">false</bool>
-			</Properties>
-		</Item>
-		<Item class="Folder" referent="RBX38D84E3FC447">
-			<Properties>
-				<string name="Name">Components</string>
-			</Properties>
-			<Item class="ModuleScript" referent="RBX6D3252E7BA29">
-				<Properties>
-					<string name="Name">AnimationSerializer</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+
+
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="2">
+      <Properties>
+        <string name="Name">Components</string>
+      </Properties>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">AnimationSerializer</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -1246,13 +2189,13 @@ function AnimationSerializer:deserialize(
 end
 
 return AnimationSerializer
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBXE8055E80FE89">
-				<Properties>
-					<string name="Name">AnimationSimplifier</string>
-					<ProtectedString name="Source"><![CDATA[--[[
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">AnimationSimplifier</string>
+          <string name="Source"><![CDATA[--[[
 	AnimationSimplifier.lua
 	Reduces animation keyframe data for lower bandwidth/memory usage in-game.
 	
@@ -1927,13 +2870,13 @@ function M.simplify(animationData: {any}, options: {any}?): ({any}, string)
 end
 
 return M
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX1D396B1EE36B">
-				<Properties>
-					<string name="Name">BaseXX</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">BaseXX</string>
+          <string name="Source"><![CDATA[--!native
 --!optimize 2
 --!strict
 
@@ -2365,13 +3308,13 @@ end
 --------------------------------------------------------------------------------
 
 return basexx
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX94940C67DCFD">
-				<Properties>
-					<string name="Name">BlenderConnection</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">BlenderConnection</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -2628,13 +3571,13 @@ function BlenderConnection:GetBoneRest(port: number, armatureName: string)
 end
 
 return BlenderConnection
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBXF25F1BBA1F35">
-				<Properties>
-					<string name="Name">DeflateLua</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="7">
+        <Properties>
+          <string name="Name">DeflateLua</string>
+          <string name="Source"><![CDATA[--!native
 --!optimize 2
 
 local M = { _TYPE = "module", _NAME = "compress.deflatelua", _VERSION = "0.3.20111128" }
@@ -3273,17 +4216,17 @@ function M.inflate_zlib(t)
 end
 
 return M
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="Folder" referent="RBXA94B3C275753">
-				<Properties>
-					<string name="Name">PluginComponents</string>
-				</Properties>
-				<Item class="ModuleScript" referent="RBXE01E91901CE9">
-					<Properties>
-						<string name="Name">Toolbar</string>
-						<ProtectedString name="Source"><![CDATA[local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="8">
+        <Properties>
+          <string name="Name">PluginComponents</string>
+        </Properties>
+        <Item class="ModuleScript" referent="9">
+          <Properties>
+            <string name="Name">Toolbar</string>
+            <string name="Source"><![CDATA[local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
 
 local Hydrate = Fusion.Hydrate
 
@@ -3311,13 +4254,13 @@ return function(props: ToolbarProperties): PluginToolbar
 
 	return Hydrate(newToolbar)(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX8F8D0CD7D3A5">
-					<Properties>
-						<string name="Name">ToolbarButton</string>
-						<ProtectedString name="Source"><![CDATA[local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">ToolbarButton</string>
+            <string name="Source">local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
 
 local PluginComponents = script.Parent
 local StudioComponents = PluginComponents.Parent:FindFirstChild("StudioComponents")
@@ -3339,7 +4282,7 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type ToolbarProperties = {
-	Active: types.CanBeState<boolean>?,
+	Active: types.CanBeState&lt;boolean>?,
 	Toolbar: PluginToolbar,
 	ToolTip: string,
 	Image: string,
@@ -3373,13 +4316,13 @@ return function(props: ToolbarProperties)
 	end
 
 	return Hydrate(toolbarButton)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX8A09106F8A3A">
-					<Properties>
-						<string name="Name">Widget</string>
-						<ProtectedString name="Source"><![CDATA[local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="11">
+          <Properties>
+            <string name="Name">Widget</string>
+            <string name="Source">local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
 
 local Hydrate = Fusion.Hydrate
 
@@ -3409,36 +4352,43 @@ return function(props: PluginGuiProperties)
 	local PluginInstance = props.Plugin
 	assert(PluginInstance, "Widget requires a 'Plugin' property to be passed")
 	
+	local widgetId = props.Id or "BlenderAnimationsMain"
+	local dockState = if typeof(props.InitialDockTo) == "string" then Enum.InitialDockState[props.InitialDockTo] else (props.InitialDockTo or Enum.InitialDockState.Right)
+	
 	local newWidget = PluginInstance:CreateDockWidgetPluginGui(
-		props.Id, 
+		widgetId, 
 		DockWidgetPluginGuiInfo.new(
-			if typeof(props.InitialDockTo) == "string" then Enum.InitialDockState[props.InitialDockTo] else props.InitialDockTo,
-			props.InitialEnabled,
-			props.ForceInitialEnabled,
-			props.FloatingSize.X, props.FloatingSize.Y,
-			props.MinimumSize.X, props.MinimumSize.Y
+			dockState,
+			false,
+			false,
+			props.FloatingSize and props.FloatingSize.X or 300, props.FloatingSize and props.FloatingSize.Y or 600,
+			props.MinimumSize and props.MinimumSize.X or 220, props.MinimumSize and props.MinimumSize.Y or 350
 		)
 	)
+
+	newWidget.Title = props.Name or "Blender Animations"
+	newWidget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 	for _,propertyName in pairs(COMPONENT_ONLY_PROPERTIES) do
 		props[propertyName] = nil
 	end
 
-	props.Title = props.Name
-	
-	if typeof(props.Enabled)=="table" and props.Enabled.kind=="Value" then
+	props.Name = nil
+	props.Title = nil
+
+	if typeof(props.Enabled) == "table" and props.Enabled.set then
 		props.Enabled:set(newWidget.Enabled)
 	end
 
 	return Hydrate(newWidget)(props)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-			</Item>
-			<Item class="ModuleScript" referent="RBX11D238B40DFB">
-				<Properties>
-					<string name="Name">Pose</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+end</string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="12">
+        <Properties>
+          <string name="Name">Pose</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -3465,13 +4415,13 @@ function Pose.new(rigPart: any, transform: CFrame, easingStyle: string?, easingD
 end
 
 return Pose
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX3BE8E4E2B13E">
-				<Properties>
-					<string name="Name">Rig</string>
-					<ProtectedString name="Source"><![CDATA[--!strict
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
+          <string name="Name">Rig</string>
+          <string name="Source"><![CDATA[--!strict
 --!optimize 2
 
 local Rig = {}
@@ -4563,13 +5513,13 @@ function Rig:AddParts(part)
 end
 
 return Rig
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX116DAB556D92">
-				<Properties>
-					<string name="Name">RigPart</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="14">
+        <Properties>
+          <string name="Name">RigPart</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -5205,18 +6155,18 @@ function RigPart:Encode(handledParts, opts)
 end
 
 return RigPart
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="Folder" referent="RBX48C7966AC452">
-				<Properties>
-					<string name="Name">StudioComponents</string>
-				</Properties>
-				<Item class="ModuleScript" referent="RBXFB43CE037437">
-					<Properties>
-						<string name="Name">Background</string>
-						<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="15">
+        <Properties>
+          <string name="Name">StudioComponents</string>
+        </Properties>
+        <Item class="ModuleScript" referent="16">
+          <Properties>
+            <string name="Name">Background</string>
+            <string name="Source">local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -5234,8 +6184,8 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type BackgroundProperties = {
-	StudioStyleGuideColor: types.CanBeState<Enum.StudioStyleGuideColor>?,
-	StudioStyleGuideModifier: types.CanBeState<Enum.StudioStyleGuideModifier>?,
+	StudioStyleGuideColor: types.CanBeState&lt;Enum.StudioStyleGuideColor>?,
+	StudioStyleGuideModifier: types.CanBeState&lt;Enum.StudioStyleGuideModifier>?,
 	[any]: any,
 }
 
@@ -5252,17 +6202,17 @@ return function(props: BackgroundProperties): Frame
 			props.StudioStyleGuideModifier
 		),
 	})(stripProps(props, COMPONENT_ONLY_PROPERTIES))
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXC3C68B723AF7">
-					<Properties>
-						<string name="Name">BaseButton</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="17">
+          <Properties>
+            <string name="Name">BaseButton</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 local State = require(script.Parent.Parent.Parent.state)
 
 local StudioComponents = script.Parent
@@ -5295,11 +6245,11 @@ local COMPONENT_ONLY_PROPERTIES = {
 	"Enabled",
 }
 
-type styleGuideColorInput = (Enum.StudioStyleGuideColor | types.StateObject<Enum.StudioStyleGuideColor>)?
+type styleGuideColorInput = (Enum.StudioStyleGuideColor | types.StateObject&lt;Enum.StudioStyleGuideColor>)?
 
 export type BaseButtonProperties = {
 	Activated: (() -> nil)?,
-	Enabled: (boolean | types.StateObject<boolean>)?,
+	Enabled: (boolean | types.StateObject&lt;boolean>)?,
 	TextColorStyle: styleGuideColorInput,
 	BackgroundColorStyle: styleGuideColorInput,
 	BorderColorStyle: styleGuideColorInput,
@@ -5382,17 +6332,17 @@ return function(props: BaseButtonProperties): TextButton
 
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newBaseButton)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX44E05A92255A">
-					<Properties>
-						<string name="Name">BaseScrollFrame</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="18">
+          <Properties>
+            <string name="Name">BaseScrollFrame</string>
+            <string name="Source">-- Written by @boatbomber
 -- Modified by @mvyasu
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -5427,13 +6377,13 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 export type BaseScrollFrameProperties = {
-	ScrollBarBorderMode:  types.CanBeState<Enum.BorderMode>?,
-	CanvasSize: types.CanBeState<UDim2>?,
-	ScrollingEnabled: types.CanBeState<boolean>?,
-	ScrollBarThickness: types.CanBeState<number>?,
-	VerticalScrollBarPosition: types.CanBeState<Enum.VerticalScrollBarPosition>?,
-	VerticalScrollBarInset: types.CanBeState<Enum.ScrollBarInset>?,
-	AutomaticCanvasSize: types.CanBeState<Enum.AutomaticSize>?,
+	ScrollBarBorderMode:  types.CanBeState&lt;Enum.BorderMode>?,
+	CanvasSize: types.CanBeState&lt;UDim2>?,
+	ScrollingEnabled: types.CanBeState&lt;boolean>?,
+	ScrollBarThickness: types.CanBeState&lt;number>?,
+	VerticalScrollBarPosition: types.CanBeState&lt;Enum.VerticalScrollBarPosition>?,
+	VerticalScrollBarInset: types.CanBeState&lt;Enum.ScrollBarInset>?,
+	AutomaticCanvasSize: types.CanBeState&lt;Enum.AutomaticSize>?,
 	[any]: any,
 }
 
@@ -5468,8 +6418,8 @@ return function(props: BaseScrollFrameProperties): Frame
 		--the scrollbar padding/inset matches what is visually shown
 		local windowSize = scrollFrame.AbsoluteWindowSize
 		local canvasSize = scrollFrame.AbsoluteCanvasSize
-		barVisibility.Vertical:set(math.round(windowSize.Y) < math.round(canvasSize.Y))
-		barVisibility.Horizontal:set(math.round(windowSize.X) < math.round(canvasSize.X))
+		barVisibility.Vertical:set(math.round(windowSize.Y) &lt; math.round(canvasSize.Y))
+		barVisibility.Horizontal:set(math.round(windowSize.X) &lt; math.round(canvasSize.X))
 	end
 
 	local zIndex = props.ZIndex or 1
@@ -5548,16 +6498,16 @@ return function(props: BaseScrollFrameProperties): Frame
 
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(containerFrame)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-					<Item class="ModuleScript" referent="RBX47AC24E1DB5E">
-						<Properties>
-							<string name="Name">ScrollArrow</string>
-							<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+end</string>
+          </Properties>
+          <Item class="ModuleScript" referent="19">
+            <Properties>
+              <string name="Name">ScrollArrow</string>
+              <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -5588,13 +6538,13 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type ScrollArrowProperties = {
-	Enabled: types.CanBeState<boolean>?,
-	Direction: types.CanBeState<string>,
+	Enabled: types.CanBeState&lt;boolean>?,
+	Direction: types.CanBeState&lt;string>,
 	Activated: () -> nil,
 	[any]: any,
 }
 
-local function getBaseProperties(mainModifier: types.CanBeState<Enum.StudioStyleGuideModifier>, props: ScrollArrowProperties)
+local function getBaseProperties(mainModifier: types.CanBeState&lt;Enum.StudioStyleGuideModifier>, props: ScrollArrowProperties)
 	return {
 		Size = DEFAULT_ARROW_SIZE,
 		Image = DEFAULT_ARROW_IMAGE,
@@ -5727,17 +6677,17 @@ return function(props: ScrollArrowProperties): ImageButton
 	end
 
 	return Hydrate(newScrollArrow)(stripProps(props, COMPONENT_ONLY_PROPERTIES))
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXBFC5D5BBB8B3">
-						<Properties>
-							<string name="Name">ScrollBar</string>
-							<ProtectedString name="Source"><![CDATA[-- Writen by @boatbomber
+end</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="20">
+            <Properties>
+              <string name="Name">ScrollBar</string>
+              <string name="Source">-- Writen by @boatbomber
 -- Modified by @mvyasu
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -5770,16 +6720,16 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type ScrollBarProperties = {
-	VerticalScrollBarPosition: types.CanBeState<Enum.VerticalScrollBarPosition>?,
-	BorderMode: types.CanBeState<Enum.BorderMode>?,
-	CanvasPosition: types.CanBeState<UDim2>,
-	AbsoluteSize: types.CanBeState<Vector2>,
-	AbsoluteCanvasSize: types.CanBeState<Vector2>,
-	WindowSize: types.CanBeState<Vector2>,
-	ScrollBarThickness: types.CanBeState<number>,
+	VerticalScrollBarPosition: types.CanBeState&lt;Enum.VerticalScrollBarPosition>?,
+	BorderMode: types.CanBeState&lt;Enum.BorderMode>?,
+	CanvasPosition: types.CanBeState&lt;UDim2>,
+	AbsoluteSize: types.CanBeState&lt;Vector2>,
+	AbsoluteCanvasSize: types.CanBeState&lt;Vector2>,
+	WindowSize: types.CanBeState&lt;Vector2>,
+	ScrollBarThickness: types.CanBeState&lt;number>,
 	BarVisibility: {
-		Horizontal: types.CanBeState<boolean>,
-		Vertical: types.CanBeState<boolean>,
+		Horizontal: types.CanBeState&lt;boolean>,
+		Vertical: types.CanBeState&lt;boolean>,
 	},
 	IsVertical: boolean,
 	[any]: any,
@@ -5962,15 +6912,15 @@ return function(props: ScrollBarProperties): ImageButton
 			},
 		}
 	})(stripProps(props, COMPONENT_ONLY_PROPERTIES))
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="ModuleScript" referent="RBXADC5BA8774DA">
-					<Properties>
-						<string name="Name">BoxBorder</string>
-						<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+end</string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="ModuleScript" referent="21">
+          <Properties>
+            <string name="Name">BoxBorder</string>
+            <string name="Source"><![CDATA[local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -6035,17 +6985,17 @@ return function(props: BoxBorderProperties): GuiObject
 	
 	return Hydrate(props[Children])(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX6B46800175AD">
-					<Properties>
-						<string name="Name">Button</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="22">
+          <Properties>
+            <string name="Name">Button</string>
+            <string name="Source"><![CDATA[-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -6066,14 +7016,14 @@ return function(props: ButtonProperties): TextButton
 	local newButton = BaseButton(props)
 	return newButton
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXA46BBCD47F47">
-					<Properties>
-						<string name="Name">Checkbox</string>
-						<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="23">
+          <Properties>
+            <string name="Name">Checkbox</string>
+            <string name="Source"><![CDATA[local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -6284,17 +7234,17 @@ return function(props: CheckboxProperties): Frame
 
 	return Hydrate(newCheckboxFrame)(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXE190634B2BA1">
-					<Properties>
-						<string name="Name">ClassIcon</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="24">
+          <Properties>
+            <string name="Name">ClassIcon</string>
+            <string name="Source"><![CDATA[-- Written by @boatbomber
 
 local StudioService = game:GetService("StudioService")
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -6339,17 +7289,17 @@ return function(props: ClassIconProperties): Frame
 		end),
 	})(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXD6B30D974CE5">
-					<Properties>
-						<string name="Name">ColorPicker</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="25">
+          <Properties>
+            <string name="Name">ColorPicker</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -6383,11 +7333,11 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type ColorPickerProperties = {
-	ListDisplayMode: (Enum.ListDisplayMode | types.StateObject<Enum.ListDisplayMode>)?,
-	Enabled: (boolean | types.StateObject<boolean>)?,
+	ListDisplayMode: (Enum.ListDisplayMode | types.StateObject&lt;Enum.ListDisplayMode>)?,
+	Enabled: (boolean | types.StateObject&lt;boolean>)?,
 	OnChange: (newColor: Color3) -> nil,
-	Value: (Color3 | types.Value<Color3>)?,
-	Step: (Vector2 | types.Value<Vector2>)?,
+	Value: (Color3 | types.Value&lt;Color3>)?,
+	Step: (Vector2 | types.Value&lt;Vector2>)?,
 	[any]: any,
 }
 
@@ -6436,7 +7386,7 @@ return function(props: ColorPickerProperties): Frame
 	end)
 
 	local function roundNumber(number: number)
-		return if (1-number)<.01 or number<.01 then math.round(number) else number
+		return if (1-number)&lt;.01 or number&lt;.01 then math.round(number) else number
 	end
 
 	local lastUpdatedColor = nil
@@ -6607,17 +7557,17 @@ return function(props: ColorPickerProperties): Frame
 
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newColorPicker)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXD5A85B395D0A">
-					<Properties>
-						<string name="Name">Dropdown</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="26">
+          <Properties>
+            <string name="Name">Dropdown</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -6661,11 +7611,11 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type DropdownProperties = {
-	Enabled: types.CanBeState<boolean>?,
-	Value: types.CanBeState<any>?,
-	Options: types.CanBeState<{any}>,
-	MaxVisibleItems: types.CanBeState<number>?,
-	HideDropdownWhenMouseLeaves: types.CanBeState<boolean>?,
+	Enabled: types.CanBeState&lt;boolean>?,
+	Value: types.CanBeState&lt;any>?,
+	Options: types.CanBeState&lt;{any}>,
+	MaxVisibleItems: types.CanBeState&lt;number>?,
+	HideDropdownWhenMouseLeaves: types.CanBeState&lt;boolean>?,
 	OnSelected: (selectedOption: any) -> nil,
 	[any]: any,
 }
@@ -7047,24 +7997,24 @@ return function(props: DropdownProperties): Frame
 	end
 
 	return Hydrate(newDropdown)(stripProps(props, COMPONENT_ONLY_PROPERTIES))
-end]]></ProtectedString>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXA823D7F1555F">
-						<Properties>
-							<string name="Name">Constants</string>
-							<ProtectedString name="Source"><![CDATA[return {
+end</string>
+          </Properties>
+          <Item class="ModuleScript" referent="27">
+            <Properties>
+              <string name="Name">Constants</string>
+              <string name="Source">return {
 	RowHeight = 25,
 	TextPaddingLeft = 5,
 	TextPaddingRight = 3,
 	MaxVisibleRows = 6,
-}]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXD28612D2D510">
-						<Properties>
-							<string name="Name">DropdownItem</string>
-							<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+}</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="28">
+            <Properties>
+              <string name="Name">DropdownItem</string>
+              <string name="Source">local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7157,15 +8107,15 @@ return function(props: DropdownItemProperties): TextButton
 	end
 	
 	return Hydrate(newDropdownItem)(hydrateProps)
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="ModuleScript" referent="RBXE869A34EE972">
-					<Properties>
-						<string name="Name">IconButton</string>
-						<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+end</string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="ModuleScript" referent="29">
+          <Properties>
+            <string name="Name">IconButton</string>
+            <string name="Source"><![CDATA[local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7280,17 +8230,17 @@ return function(props: IconButtonProperties): TextButton
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newBaseButton)(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX3F65E45B90A5">
-					<Properties>
-						<string name="Name">Label</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="30">
+          <Properties>
+            <string name="Name">Label</string>
+            <string name="Source"><![CDATA[-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7352,17 +8302,17 @@ return function(props: LabelProperties): TextLabel
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newLabel)(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="Folder" referent="RBX34DDC9FA4737">
-					<Properties>
-						<string name="Name">Licenses</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBX0483721C995B">
-						<Properties>
-							<string name="Name">StudioComponents</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="Folder" referent="31">
+          <Properties>
+            <string name="Name">Licenses</string>
+          </Properties>
+          <Item class="ModuleScript" referent="32">
+            <Properties>
+              <string name="Name">StudioComponents</string>
+              <string name="Source">--[[
 	MIT License
 
 	Copyright (c) 2021 sircfenner
@@ -7384,15 +8334,15 @@ end
 	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 	SOFTWARE.
-]]]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="ModuleScript" referent="RBX322B3695C3C1">
-					<Properties>
-						<string name="Name">LimitedTextInput</string>
-						<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+]]</string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="ModuleScript" referent="33">
+          <Properties>
+            <string name="Name">LimitedTextInput</string>
+            <string name="Source"><![CDATA[local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7476,16 +8426,16 @@ return function(props: LimitedTextInputProperties)
 		[OnChange "Text"] = updateWithLimitedText,
 	}
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX6E321C7491B3">
-					<Properties>
-						<string name="Name">Loading</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="34">
+          <Properties>
+            <string name="Name">Loading</string>
+            <string name="Source"><![CDATA[-- Written by @boatbomber
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7769,17 +8719,17 @@ return function(props: LoadingProperties): Frame
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(frame)(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX72DC93AF4267">
-					<Properties>
-						<string name="Name">MainButton</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="35">
+          <Properties>
+            <string name="Name">MainButton</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7804,16 +8754,16 @@ return function(props: Button.ButtonProperties): TextButton
 		end
 	end
 	return Button(props)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX0CF1D8C27F65">
-					<Properties>
-						<string name="Name">ProgressBar</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="36">
+          <Properties>
+            <string name="Name">ProgressBar</string>
+            <string name="Source">-- Written by @boatbomber
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7835,7 +8785,7 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type ProgressProperties = {
-	Progress: (number | types.StateObject<number>)?,
+	Progress: (number | types.StateObject&lt;number>)?,
 	[any]: any,
 }
 
@@ -7871,7 +8821,7 @@ return function(props: ProgressProperties): Frame
 					
 					Size = Computed(function()
 						local currentProgress = progress:get()
-						if currentProgress <= 0 then
+						if currentProgress &lt;= 0 then
 							return UDim2.fromOffset(0, 0)
 						end
 
@@ -7888,17 +8838,17 @@ return function(props: ProgressProperties): Frame
 
     local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
     return Hydrate(frame)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX7D2A132ADDEF">
-					<Properties>
-						<string name="Name">ScrollFrame</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="37">
+          <Properties>
+            <string name="Name">ScrollFrame</string>
+            <string name="Source">-- Written by @boatbomber
 -- Modified by @mvyasu
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -7926,8 +8876,8 @@ local COMPONENT_ONLY_PROPERTIES = {
 
 -- if you're using this component with the default sizes of the other components
 -- you'll need to have CanvasScaleConstraint set to Enum.ScrollingDirection.X
-export type ScrollFrameProperties = BaseScrollFrame.BaseScrollFrameProperties & {
-	CanvasScaleConstraint: types.CanBeState<Enum.ScrollingDirection?>?,
+export type ScrollFrameProperties = BaseScrollFrame.BaseScrollFrameProperties &amp; {
+	CanvasScaleConstraint: types.CanBeState&lt;Enum.ScrollingDirection?>?,
 	UIPadding: UIPadding?,
 	UILayout: UILayout?,
 } 
@@ -7985,13 +8935,13 @@ return function(props: ScrollFrameProperties): Frame
 	end
 	
 	return BaseScrollFrame(stripProps(scrollFrameProps, COMPONENT_ONLY_PROPERTIES))
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXB718CBFEEB1E">
-					<Properties>
-						<string name="Name">Shadow</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="38">
+          <Properties>
+            <string name="Name">Shadow</string>
+            <string name="Source"><![CDATA[-- Written by @boatbomber
 
 type ShadowProperties = {
     Side: string,
@@ -7999,8 +8949,8 @@ type ShadowProperties = {
 	[any]: any,
 }
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -8073,17 +9023,17 @@ return function(props: ShadowProperties): Frame
 		Position = Side.position,
 	}
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX242F3C899360">
-					<Properties>
-						<string name="Name">Slider</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="39">
+          <Properties>
+            <string name="Name">Slider</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -8121,13 +9071,13 @@ local COMPONENT_ONLY_PROPERTIES = {
 	"Enabled",
 }
 
-type numberInput = types.CanBeState<number>?
+type numberInput = types.CanBeState&lt;number>?
 
 type SliderProperties = {
-	HandleSize: types.CanBeState<UDim2>?,
-	Enabled: types.CanBeState<boolean>?,
+	HandleSize: types.CanBeState&lt;UDim2>?,
+	Enabled: types.CanBeState&lt;boolean>?,
 	OnChange: ((newValue: number) -> nil)?,
-	Value: types.CanBeState<number>?,
+	Value: types.CanBeState&lt;number>?,
 	Min: numberInput,
 	Max: numberInput,
 	Step: numberInput,
@@ -8280,17 +9230,17 @@ return function(props: SliderProperties): TextButton
 
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newSlider)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX827313A67CDE">
-					<Properties>
-						<string name="Name">TextInput</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="40">
+          <Properties>
+            <string name="Name">TextInput</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -8323,7 +9273,7 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 export type TextInputProperties = {
-	Enabled: (boolean | types.StateObject<boolean>)?,
+	Enabled: (boolean | types.StateObject&lt;boolean>)?,
 	[any]: any,
 }
 
@@ -8404,16 +9354,16 @@ return function(props: TextInputProperties): TextLabel
 
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newTextBox)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXC15EF68B7C48">
-					<Properties>
-						<string name="Name">Title</string>
-						<ProtectedString name="Source"><![CDATA[-- Written by @boatbomber
+end</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="41">
+          <Properties>
+            <string name="Name">Title</string>
+            <string name="Source"><![CDATA[-- Written by @boatbomber
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -8471,27 +9421,27 @@ return function(props: LabelProperties): TextLabel
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 	return Hydrate(newLabel)(hydrateProps)
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="Folder" referent="RBXAF4E5B691B51">
-					<Properties>
-						<string name="Name">Util</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXAEB98453E5C8">
-						<Properties>
-							<string name="Name">constants</string>
-							<ProtectedString name="Source"><![CDATA[return {
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="Folder" referent="42">
+          <Properties>
+            <string name="Name">Util</string>
+          </Properties>
+          <Item class="ModuleScript" referent="43">
+            <Properties>
+              <string name="Name">constants</string>
+              <string name="Source">return {
 	CurvedBoxes = true,
 	CornerRadius = UDim.new(0, 2),
 	TextSize = 14,
-}]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX74F4BA01C39E">
-						<Properties>
-							<string name="Name">getDragInput</string>
-							<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+}</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="44">
+            <Properties>
+              <string name="Name">getDragInput</string>
+              <string name="Source"><![CDATA[-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
 --[[
@@ -8518,8 +9468,8 @@ end
 
 --]]
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local getState = require(script.Parent.getState)
 local unwrap = require(script.Parent.unwrap)
@@ -8662,14 +9612,14 @@ return function(props: DragInputProperites): (vector2Value, types.Computed<Vecto
 
 	return currentValue, currentAlpha, isDragging
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXB5578A9B0DE2">
-						<Properties>
-							<string name="Name">getModifier</string>
-							<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="45">
+            <Properties>
+              <string name="Name">getModifier</string>
+              <string name="Source">local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local Computed = Fusion.Computed
 
@@ -8677,14 +9627,14 @@ local unwrap = require(script.Parent.unwrap)
 local types = require(script.Parent.types)
 
 type modifierInput = {
-	Enabled: types.CanBeState<boolean>?,
-	Hovering: types.CanBeState<boolean>?,
-	Selected: types.CanBeState<boolean>?,
-	Pressed: types.CanBeState<boolean>?,
-	Otherwise: types.CanBeState<Enum.StudioStyleGuideModifier>?,
+	Enabled: types.CanBeState&lt;boolean>?,
+	Hovering: types.CanBeState&lt;boolean>?,
+	Selected: types.CanBeState&lt;boolean>?,
+	Pressed: types.CanBeState&lt;boolean>?,
+	Otherwise: types.CanBeState&lt;Enum.StudioStyleGuideModifier>?,
 }
 
-return function(modifierInput: modifierInput): types.Computed<any>
+return function(modifierInput: modifierInput): types.Computed&lt;any>
 	local isEnabled = modifierInput.Enabled
 	local isHovering = modifierInput.Hovering
 	local isSelected = modifierInput.Selected
@@ -8706,14 +9656,14 @@ return function(modifierInput: modifierInput): types.Computed<any>
 		end
 		return unwrap(modifierInput.Otherwise) or Enum.StudioStyleGuideModifier.Default
 	end)
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXC701A563D459">
-						<Properties>
-							<string name="Name">getMotionState</string>
-							<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+end</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="46">
+            <Properties>
+              <string name="Name">getMotionState</string>
+              <string name="Source">local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local Computed = Fusion.Computed
 
@@ -8725,7 +9675,7 @@ local types = require(script.Parent.types)
 local isMotionEnabled = true
 
 --motionStateTypes: Tween, Spring
-return function(goalState: types.StateObject<any>, motionStateType: string, ...:any): types.CanBeState<any>
+return function(goalState: types.StateObject&lt;any>, motionStateType: string, ...:any): types.CanBeState&lt;any>
 	local motionTypeFn = Fusion[motionStateType]
 	if typeof(motionTypeFn)~="function" then
 		warn(("[%s]: No motionStateType with the name '%s' was found in Fusion!"):format(script.Name, tostring(motionStateType)))
@@ -8745,18 +9695,18 @@ return function(goalState: types.StateObject<any>, motionStateType: string, ...:
 	else
 		return if isMotionEnabled then motionGoalState else goalState
 	end
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXF17465547E69">
-						<Properties>
-							<string name="Name">getSelectedState</string>
-							<ProtectedString name="Source"><![CDATA[local unwrap = require(script.Parent.unwrap)
+end</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="47">
+            <Properties>
+              <string name="Name">getSelectedState</string>
+              <string name="Source">local unwrap = require(script.Parent.unwrap)
 local types = require(script.Parent.types)
 
 type GetSelectedStateProperties = {
-	Value: types.Value<any>?,
-	Options: types.CanBeState<{any}>?,
+	Value: types.Value&lt;any>?,
+	Options: types.CanBeState&lt;{any}>?,
 	OnSelected: ((selectedOption: any)->nil)?,
 }
 
@@ -8775,19 +9725,19 @@ return function(props: GetSelectedStateProperties): ()->any
 		end
 		return currentValue
 	end
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX2D3992A95C19">
-						<Properties>
-							<string name="Name">getState</string>
-							<ProtectedString name="Source"><![CDATA[local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+end</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="48">
+            <Properties>
+              <string name="Name">getState</string>
+              <string name="Source">local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local unwrap = require(script.Parent.unwrap)
 local types = require(script.Parent.types)
 
-type stateOrAny = types.StateObject<any> | any
+type stateOrAny = types.StateObject&lt;any> | any
 
 return function(inputValue: stateOrAny, defaultValue: stateOrAny, mustBeKind: string?)
 	local stateKind = mustBeKind or "Value"
@@ -8801,34 +9751,34 @@ return function(inputValue: stateOrAny, defaultValue: stateOrAny, mustBeKind: st
 	end
 	
 	return if isDefaultAState then defaultValue else Fusion[stateKind](defaultValue)
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX6337DB2E66AF">
-						<Properties>
-							<string name="Name">stripProps</string>
-							<ProtectedString name="Source"><![CDATA[return function(props, exclude)
+end</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="49">
+            <Properties>
+              <string name="Name">stripProps</string>
+              <string name="Source"><![CDATA[return function(props, exclude)
     local export = table.clone(props)
     for _, k in ipairs(exclude) do
         export[k] = nil
     end
     return export
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX88EBBF23184E">
-						<Properties>
-							<string name="Name">themeProvider</string>
-							<ProtectedString name="Source"><![CDATA[local types = require(script.Parent.types)
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="50">
+            <Properties>
+              <string name="Name">themeProvider</string>
+              <string name="Source"><![CDATA[local types = require(script.Parent.types)
 
 type styleStyleGuideColor = Enum.StudioStyleGuideColor | types.StateObject<Enum.StudioStyleGuideColor>
 type styleGuideModifier = Enum.StudioStyleGuideModifier | types.StateObject<Enum.StudioStyleGuideModifier>
 type computedOrValue = types.Computed<Color3> | types.Value<Color3>
 
 local Studio = settings().Studio
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local unwrap = require(script.Parent.unwrap)
 
@@ -8916,26 +9866,33 @@ do
 	local themeChangedConnection = Studio.ThemeChanged:Connect(updateTheme)
 	updateTheme()
 
-	Plugin.Unloading:Connect(function()
-		themeChangedConnection:Disconnect()
-		themeChangedConnection = nil
-	end)
+	local pluginInstance = plugin or (script:FindFirstAncestorWhichIsA("Plugin"))
+	if pluginInstance and pluginInstance.Unloading then
+		pcall(function()
+			pluginInstance.Unloading:Connect(function()
+				if themeChangedConnection then
+					themeChangedConnection:Disconnect()
+					themeChangedConnection = nil
+				end
+			end)
+		end)
+	end
 end
 
 return themeProvider
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX74F47D50DC09">
-						<Properties>
-							<string name="Name">types</string>
-							<ProtectedString name="Source"><![CDATA[--!strict
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="51">
+            <Properties>
+              <string name="Name">types</string>
+              <string name="Source">--!strict
 
 -- This is a duplicate of Fusion's PubTypes module because for whatever reason type checking doesn't like :FindFirstAncestorWhichIsA()
 -- While not a pretty solution, it's the easier solution without causing a huge mess within the components 
 -- If the components are updated to use a newer version of Fusion, then this types module can be updated too
 
-type Set<T> = {[T]: any}
+type Set&lt;T> = {[T]: any}
 
 --[[
 	General use types
@@ -8989,69 +9946,69 @@ export type Version = {
 
 -- A graph object which can have dependents.
 export type Dependency = {
-	dependentSet: Set<Dependent>
+	dependentSet: Set&lt;Dependent>
 }
 
 -- A graph object which can have dependencies.
 export type Dependent = {
 	update: (Dependent) -> boolean,
-	dependencySet: Set<Dependency>
+	dependencySet: Set&lt;Dependency>
 }
 
 -- An object which stores a piece of reactive state.
-export type StateObject<T> = Dependency & {
+export type StateObject&lt;T> = Dependency &amp; {
 	type: string, -- replace with "State" when Luau supports singleton types
 	kind: string,
-	get: (StateObject<T>, asDependency: boolean?) -> T
+	get: (StateObject&lt;T>, asDependency: boolean?) -> T
 }
 
 -- Either a constant value of type T, or a state object containing type T.
-export type CanBeState<T> = StateObject<T> | T
+export type CanBeState&lt;T> = StateObject&lt;T> | T
 
 --[[
 	Specific reactive graph types
 ]]
 
 -- A state object whose value can be set at any time by the user.
-export type Value<T> = StateObject<T> & {
+export type Value&lt;T> = StateObject&lt;T> &amp; {
 	-- kind: "State" (add this when Luau supports singleton types)
-	set: (Value<T>, newValue: any, force: boolean?) -> ()
+	set: (Value&lt;T>, newValue: any, force: boolean?) -> ()
 }
 
 -- A state object whose value is derived from other objects using a callback.
-export type Computed<T> = StateObject<T> & Dependent & {
+export type Computed&lt;T> = StateObject&lt;T> &amp; Dependent &amp; {
 	-- kind: "Computed" (add this when Luau supports singleton types)
 }
 
 -- A state object whose value is derived from other objects using a callback.
-export type ForPairs<KO, VO> = StateObject<{ [KO]: VO }> & Dependent & {
+export type ForPairs&lt;KO, VO> = StateObject&lt;{ [KO]: VO }> &amp; Dependent &amp; {
 	-- kind: "ForPairs" (add this when Luau supports singleton types)
 }
 -- A state object whose value is derived from other objects using a callback.
-export type ForKeys<KO, V> = StateObject<{ [KO]: V }> & Dependent & {
+export type ForKeys&lt;KO, V> = StateObject&lt;{ [KO]: V }> &amp; Dependent &amp; {
 	-- kind: "ForKeys" (add this when Luau supports singleton types)
 }
 -- A state object whose value is derived from other objects using a callback.
-export type ForValues<K, VO> = StateObject<{ [K]: VO }> & Dependent & {
+export type ForValues&lt;K, VO> = StateObject&lt;{ [K]: VO }> &amp; Dependent &amp; {
 	-- kind: "ForKeys" (add this when Luau supports singleton types)
 }
 
 -- A state object which follows another state object using tweens.
-export type Tween<T> = StateObject<T> & Dependent & {
+export type Tween&lt;T> = StateObject&lt;T> &amp; Dependent &amp; {
 	-- kind: "Tween" (add this when Luau supports singleton types)
 }
 
 -- A state object which follows another state object using spring simulation.
-export type Spring<T> = StateObject<T> & Dependent & {
+export type Spring&lt;T> = StateObject&lt;T> &amp; Dependent &amp; {
 	-- kind: "Spring" (add this when Luau supports singleton types)
 	-- Uncomment when ENABLE_PARAM_SETTERS is enabled
-	-- setPosition: (Spring<T>, newValue: Animatable) -> (),
-	-- setVelocity: (Spring<T>, newValue: Animatable) -> (),
-	-- addVelocity: (Spring<T>, deltaValue: Animatable) -> ()
+	-- setPosition: (Spring&lt;T>, newValue: Animatable) -> (),
+	-- setVelocity: (Spring&lt;T>, newValue: Animatable) -> (),
+	-- addVelocity: (Spring&lt;T>, deltaValue: Animatable) -> ()
 }
 
 -- An object which can listen for updates on another state object.
-export type Observer = Dependent & {
+export type Observer = Dependent &amp; {
 	-- kind: "Observer" (add this when Luau supports singleton types)
 	onChange: (Observer, callback: () -> ()) -> (() -> ())
 }
@@ -9075,34 +10032,34 @@ export type SpecialKey = {
 }
 
 -- A collection of instances that may be parented to another instance.
-export type Children = Instance | StateObject<Children> | {[any]: Children}
+export type Children = Instance | StateObject&lt;Children> | {[any]: Children}
 
 -- A table that defines an instance's properties, handlers and children.
 export type PropertyTable = {[string | SpecialKey]: any}
 
-return nil]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX4A60DB6054C9">
-						<Properties>
-							<string name="Name">unwrap</string>
-							<ProtectedString name="Source"><![CDATA[return function(x: any, useDependency: boolean?): any
+return nil</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="52">
+            <Properties>
+              <string name="Name">unwrap</string>
+              <string name="Source">return function(x: any, useDependency: boolean?): any
 	if typeof(x)=="table" and x.type=="State" then
 		return x:get(useDependency)
 	end
 	return x
-end]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="ModuleScript" referent="RBX02B344E2B5D2">
-					<Properties>
-						<string name="Name">VerticalCollapsibleSection</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+end</string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="ModuleScript" referent="53">
+          <Properties>
+            <string name="Name">VerticalCollapsibleSection</string>
+            <string name="Source"><![CDATA[-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -9313,17 +10270,17 @@ return function(props: VerticalExpandingListProperties): Frame
 		}
 	})(stripProps(props, COMPONENT_ONLY_PROPERTIES))
 end
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX8DE6E506C9D3">
-					<Properties>
-						<string name="Name">VerticalExpandingList</string>
-						<ProtectedString name="Source"><![CDATA[-- Roact version by @sircfenner
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="54">
+          <Properties>
+            <string name="Name">VerticalExpandingList</string>
+            <string name="Source">-- Roact version by @sircfenner
 -- Ported to Fusion by @YasuYoshida
 
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Fusion = require(internal:FindFirstChild("Fusion", true) or internal.Packages.Fusion)
 local State = require(script.Parent.Parent.Parent.state)
 
 local StudioComponents = script.Parent
@@ -9350,7 +10307,7 @@ local COMPONENT_ONLY_PROPERTIES = {
 }
 
 type VerticalExpandingListProperties = {
-	Padding: (UDim | types.StateObject<UDim>)?,
+	Padding: (UDim | types.StateObject&lt;UDim>)?,
 	[any]: any,
 }
 
@@ -9397,18 +10354,18 @@ return function(props: VerticalExpandingListProperties): Frame
 			}
 		}
 	)(hydrateProps)
-end]]></ProtectedString>
-					</Properties>
-				</Item>
-			</Item>
-			<Item class="Folder" referent="RBX59467FD58F02">
-				<Properties>
-					<string name="Name">roblox_testez@0.4.1</string>
-				</Properties>
-				<Item class="ModuleScript" referent="RBX411468CD25E6">
-					<Properties>
-						<string name="Name">testez</string>
-						<ProtectedString name="Source"><![CDATA[local Expectation = require(script.Expectation)
+end</string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Folder" referent="55">
+        <Properties>
+          <string name="Name">roblox_testez@0.4.1</string>
+        </Properties>
+        <Item class="ModuleScript" referent="56">
+          <Properties>
+            <string name="Name">testez</string>
+            <string name="Source">local Expectation = require(script.Expectation)
 local TestBootstrap = require(script.TestBootstrap)
 local TestEnum = require(script.TestEnum)
 local TestPlan = require(script.TestPlan)
@@ -9447,12 +10404,12 @@ local TestEZ = {
 	},
 }
 
-return TestEZ]]></ProtectedString>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXA193C665508F">
-						<Properties>
-							<string name="Name">Context</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+return TestEZ</string>
+          </Properties>
+          <Item class="ModuleScript" referent="57">
+            <Properties>
+              <string name="Name">Context</string>
+              <string name="Source"><![CDATA[--[[
 	The Context object implements a write-once key-value store. It also allows
 	for a new Context object to inherit the entries from an existing one.
 ]]
@@ -9478,13 +10435,13 @@ function Context.new(parent)
 end
 
 return Context
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXC06A02F02FF0">
-						<Properties>
-							<string name="Name">Expectation</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="58">
+            <Properties>
+              <string name="Name">Expectation</string>
+              <string name="Source"><![CDATA[--[[
 	Allows creation of expectation statements designed for behavior-driven
 	testing (BDD). See Chai (JS) or RSpec (Ruby) for examples of other BDD
 	frameworks.
@@ -9795,13 +10752,13 @@ function Expectation:throw(messageSubstring)
 end
 
 return Expectation
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX6873E0E7BBFA">
-						<Properties>
-							<string name="Name">ExpectationContext</string>
-							<ProtectedString name="Source"><![CDATA[local Expectation = require(script.Parent.Expectation)
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="59">
+            <Properties>
+              <string name="Name">ExpectationContext</string>
+              <string name="Source"><![CDATA[local Expectation = require(script.Parent.Expectation)
 local checkMatcherNameCollisions = Expectation.checkMatcherNameCollisions
 
 local function copy(t)
@@ -9839,13 +10796,13 @@ function ExpectationContext:extend(config)
 end
 
 return ExpectationContext
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXF29F085EDFB3">
-						<Properties>
-							<string name="Name">LifecycleHooks</string>
-							<ProtectedString name="Source"><![CDATA[local TestEnum = require(script.Parent.TestEnum)
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="60">
+            <Properties>
+              <string name="Name">LifecycleHooks</string>
+              <string name="Source"><![CDATA[local TestEnum = require(script.Parent.TestEnum)
 
 local LifecycleHooks = {}
 LifecycleHooks.__index = LifecycleHooks
@@ -9934,17 +10891,17 @@ function LifecycleHooks:_getHooksOfType(nodes, key)
 end
 
 return LifecycleHooks
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="Folder" referent="RBX268E863748BD">
-						<Properties>
-							<string name="Name">Reporters</string>
-						</Properties>
-						<Item class="ModuleScript" referent="RBX22FDBE1988EE">
-							<Properties>
-								<string name="Name">TeamCityReporter</string>
-								<ProtectedString name="Source"><![CDATA[local TestService = game:GetService("TestService")
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="Folder" referent="61">
+            <Properties>
+              <string name="Name">Reporters</string>
+            </Properties>
+            <Item class="ModuleScript" referent="62">
+              <Properties>
+                <string name="Name">TeamCityReporter</string>
+                <string name="Source">local TestService = game:GetService("TestService")
 
 local TestEnum = require(script.Parent.Parent.TestEnum)
 
@@ -10045,13 +11002,13 @@ function TeamCityReporter.report(results)
 	end
 end
 
-return TeamCityReporter]]></ProtectedString>
-							</Properties>
-						</Item>
-						<Item class="ModuleScript" referent="RBX118ECA3450D7">
-							<Properties>
-								<string name="Name">TextReporter</string>
-								<ProtectedString name="Source"><![CDATA[--[[
+return TeamCityReporter</string>
+              </Properties>
+            </Item>
+            <Item class="ModuleScript" referent="63">
+              <Properties>
+                <string name="Name">TextReporter</string>
+                <string name="Source">--[[
 	The TextReporter uses the results from a completed test to output text to
 	standard output and TestService.
 ]]
@@ -10071,7 +11028,7 @@ local UNKNOWN_STATUS_SYMBOL = "?"
 local TextReporter = {}
 
 local function compareNodes(a, b)
-	return a.planNode.phrase:lower() < b.planNode.phrase:lower()
+	return a.planNode.phrase:lower() &lt; b.planNode.phrase:lower()
 end
 
 local function reportNode(node, buffer, level)
@@ -10156,13 +11113,13 @@ function TextReporter.report(results)
 	end
 end
 
-return TextReporter]]></ProtectedString>
-							</Properties>
-						</Item>
-						<Item class="ModuleScript" referent="RBX4711D47218CF">
-							<Properties>
-								<string name="Name">TextReporterQuiet</string>
-								<ProtectedString name="Source"><![CDATA[--[[
+return TextReporter</string>
+              </Properties>
+            </Item>
+            <Item class="ModuleScript" referent="64">
+              <Properties>
+                <string name="Name">TextReporterQuiet</string>
+                <string name="Source">--[[
 	Copy of TextReporter that doesn't output successful tests.
 
 	This should be temporary, it's just a workaround to make CI environments
@@ -10258,14 +11215,14 @@ function TextReporterQuiet.report(results)
 	end
 end
 
-return TextReporterQuiet]]></ProtectedString>
-							</Properties>
-						</Item>
-					</Item>
-					<Item class="ModuleScript" referent="RBXCDD1F7907F0E">
-						<Properties>
-							<string name="Name">TestBootstrap</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+return TextReporterQuiet</string>
+              </Properties>
+            </Item>
+          </Item>
+          <Item class="ModuleScript" referent="65">
+            <Properties>
+              <string name="Name">TestBootstrap</string>
+              <string name="Source">--[[
 	Provides an interface to quickly run and report tests from a given object.
 ]]
 
@@ -10411,13 +11368,13 @@ function TestBootstrap:run(roots, reporter, otherOptions)
 	return results
 end
 
-return TestBootstrap]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX8475DA8808C9">
-						<Properties>
-							<string name="Name">TestEnum</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+return TestBootstrap</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="66">
+            <Properties>
+              <string name="Name">TestEnum</string>
+              <string name="Source">--[[
 	Constants used throughout the testing framework.
 ]]
 
@@ -10444,13 +11401,13 @@ TestEnum.NodeModifier = {
 	Focus = "Focus"
 }
 
-return TestEnum]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX99FA6A9D3D71">
-						<Properties>
-							<string name="Name">TestPlan</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+return TestEnum</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="67">
+            <Properties>
+              <string name="Name">TestPlan</string>
+              <string name="Source"><![CDATA[--[[
 	Represents a tree of tests that have been loaded but not necessarily
 	executed yet.
 
@@ -10754,13 +11711,13 @@ function TestPlan:findNodes(callback)
 end
 
 return TestPlan
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX90AB571129F8">
-						<Properties>
-							<string name="Name">TestPlanner</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="68">
+            <Properties>
+              <string name="Name">TestPlanner</string>
+              <string name="Source">--[[
 	Turns a series of specification functions into a test plan.
 
 	Uses a TestPlanBuilder to keep track of the state of the tree being built.
@@ -10789,7 +11746,7 @@ function TestPlanner.createPlan(modulesList, testNamePattern, extraEnvironment)
 	local plan = TestPlan.new(testNamePattern, extraEnvironment)
 
 	table.sort(modulesList, function(a, b)
-		return a.pathStringForSorting < b.pathStringForSorting
+		return a.pathStringForSorting &lt; b.pathStringForSorting
 	end)
 
 	for _, module in ipairs(modulesList) do
@@ -10799,13 +11756,13 @@ function TestPlanner.createPlan(modulesList, testNamePattern, extraEnvironment)
 	return plan
 end
 
-return TestPlanner]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX73B46484A47A">
-						<Properties>
-							<string name="Name">TestResults</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+return TestPlanner</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="69">
+            <Properties>
+              <string name="Name">TestResults</string>
+              <string name="Source">--[[
 	Represents a tree of test results.
 
 	Each node in the tree corresponds directly to a node in a corresponding
@@ -10916,13 +11873,13 @@ function TestResults:visualize(root, level)
 	return table.concat(buffer, "\n")
 end
 
-return TestResults]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXA83F62CBBB56">
-						<Properties>
-							<string name="Name">TestRunner</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+return TestResults</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="70">
+            <Properties>
+              <string name="Name">TestRunner</string>
+              <string name="Source"><![CDATA[--[[
 	Contains the logic to run a test plan and gather test results from it.
 
 	TestRunner accepts a TestPlan object, executes the planned tests, and
@@ -11110,13 +12067,13 @@ function TestRunner.runPlanNode(session, planNode, lifecycleHooks)
 end
 
 return TestRunner
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX2B9DBD2ED62E">
-						<Properties>
-							<string name="Name">TestSession</string>
-							<ProtectedString name="Source"><![CDATA[--[[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="71">
+            <Properties>
+              <string name="Name">TestSession</string>
+              <string name="Source"><![CDATA[--[[
 	Represents the state relevant while executing a test plan.
 
 	Used by TestRunner to produce a TestResults object.
@@ -11359,27 +12316,27 @@ function TestSession:setStatusFromChildren()
 end
 
 return TestSession
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-			</Item>
-			<Item class="ModuleScript" referent="RBX3549028796F1">
-				<Properties>
-					<string name="Name">testez</string>
-					<ProtectedString name="Source"><![CDATA[return require(script.Parent["roblox_testez@0.4.1"]["testez"])
-]]></ProtectedString>
-				</Properties>
-			</Item>
-		</Item>
-		<Item class="Folder" referent="RBXD327030F547F">
-			<Properties>
-				<string name="Name">Packages</string>
-			</Properties>
-			<Item class="ModuleScript" referent="RBXC46C858EFEB5">
-				<Properties>
-					<string name="Name">Fusion</string>
-					<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="72">
+        <Properties>
+          <string name="Name">testez</string>
+          <string name="Source"><![CDATA[return require(script.Parent["roblox_testez@0.4.1"]["testez"])
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="73">
+      <Properties>
+        <string name="Name">Packages</string>
+      </Properties>
+      <Item class="ModuleScript" referent="74">
+        <Properties>
+          <string name="Name">Fusion</string>
+          <string name="Source"><![CDATA[
 -- Fusion 0.2.x - Public API
 local Fusion = {}
 
@@ -11416,161 +12373,387 @@ Fusion.doNothing   = req("Utility").doNothing
 Fusion.None        = req("Utility").None
 
 return Fusion
-]]></ProtectedString>
-				</Properties>
-				<Item class="Folder" referent="RBX28FBD3EEB61F">
-					<Properties>
-						<string name="Name">Animation</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBX2A9B481DCB15">
-						<Properties>
-							<string name="Name">Spring</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: Spring
+]]></string>
+        </Properties>
+        <Item class="ModuleScript" referent="75">
+          <Properties>
+            <string name="Name">Animation</string>
+            <string name="Source"><![CDATA[
+return {
+    Spring = require(script.Spring),
+    Tween  = require(script.Tween),
+}
+]]></string>
+          </Properties>
+          <Item class="ModuleScript" referent="76">
+            <Properties>
+              <string name="Name">Spring</string>
+              <string name="Source"><![CDATA[--!native
+--!strict
+-- Fusion Animation: Spring
+
+local Spring = {}
+Spring.__index = Spring
+
+function Spring.new(goalState: any, speed: number?, damping: number?)
+    local initialVal = type(goalState) == "table" and goalState.get and goalState:get() or goalState
+    local self = setmetatable({
+        _goal = goalState,
+        _value = initialVal,
+        _speed = speed or 10,
+        _damping = damping or 1,
+        _observers = {},
+        type = "State",
+        kind = "Spring",
+    }, Spring)
+
+    if type(goalState) == "table" and goalState._observers then
+        local obs = {
+            _update = function()
+                self._value = goalState:get()
+                for o in pairs(self._observers) do
+                    task.spawn(o._update, o)
+                end
+            end
+        }
+        goalState._observers[obs] = true
+    end
+
+    return self
+end
+
+function Spring:get()
+    if type(self._goal) == "table" and self._goal.get then
+        return self._goal:get()
+    end
+    return self._value
+end
+
+function Spring:set(newGoal: any)
+    if type(self._goal) == "table" and self._goal.set then
+        self._goal:set(newGoal)
+    else
+        self._value = newGoal
+    end
+end
+
+local mt = getmetatable(Spring) or {}
+mt.__call = function(cls, goalState, speed, damping)
+    return cls.new(goalState, speed, damping)
+end
+setmetatable(Spring, mt)
+
+return Spring
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="77">
+            <Properties>
+              <string name="Name">SpringScheduler</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: SpringScheduler
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX74483E6E1E90">
-						<Properties>
-							<string name="Name">SpringScheduler</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: SpringScheduler
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="78">
+            <Properties>
+              <string name="Name">Tween</string>
+              <string name="Source"><![CDATA[--!native
+--!strict
+-- Fusion Animation: Tween
+
+local Tween = {}
+Tween.__index = Tween
+
+function Tween.new(goalState: any, tweenInfo: TweenInfo?)
+    local initialVal = type(goalState) == "table" and goalState.get and goalState:get() or goalState
+    local self = setmetatable({
+        _goal = goalState,
+        _value = initialVal,
+        _tweenInfo = tweenInfo,
+        _observers = {},
+        type = "State",
+        kind = "Tween",
+    }, Tween)
+
+    if type(goalState) == "table" and goalState._observers then
+        local obs = {
+            _update = function()
+                self._value = goalState:get()
+                for o in pairs(self._observers) do
+                    task.spawn(o._update, o)
+                end
+            end
+        }
+        goalState._observers[obs] = true
+    end
+
+    return self
+end
+
+function Tween:get()
+    if type(self._goal) == "table" and self._goal.get then
+        return self._goal:get()
+    end
+    return self._value
+end
+
+local mt = getmetatable(Tween) or {}
+mt.__call = function(cls, goalState, tweenInfo)
+    return cls.new(goalState, tweenInfo)
+end
+setmetatable(Tween, mt)
+
+return Tween
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="79">
+            <Properties>
+              <string name="Name">TweenScheduler</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: TweenScheduler
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXD5955EB63621">
-						<Properties>
-							<string name="Name">Tween</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: Tween
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="80">
+            <Properties>
+              <string name="Name">getTweenRatio</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: getTweenRatio
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX941CC847DB7F">
-						<Properties>
-							<string name="Name">TweenScheduler</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: TweenScheduler
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="81">
+            <Properties>
+              <string name="Name">lerpType</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: lerpType
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXBDB6602D3C8C">
-						<Properties>
-							<string name="Name">getTweenRatio</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: getTweenRatio
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="82">
+            <Properties>
+              <string name="Name">packType</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: packType
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX7967826C2871">
-						<Properties>
-							<string name="Name">lerpType</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: lerpType
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="83">
+            <Properties>
+              <string name="Name">springCoefficients</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: springCoefficients
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX02CA572A6D60">
-						<Properties>
-							<string name="Name">packType</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: packType
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="84">
+            <Properties>
+              <string name="Name">unpackType</string>
+              <string name="Source"><![CDATA[-- Fusion Animation stub: unpackType
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXB770741373FE">
-						<Properties>
-							<string name="Name">springCoefficients</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: springCoefficients
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="Folder" referent="85">
+          <Properties>
+            <string name="Name">Colour</string>
+          </Properties>
+          <Item class="ModuleScript" referent="86">
+            <Properties>
+              <string name="Name">Oklab</string>
+              <string name="Source"><![CDATA[-- Fusion Colour/Oklab stub
 return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX597FA7383ED4">
-						<Properties>
-							<string name="Name">unpackType</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Animation stub: unpackType
-return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="Folder" referent="RBX661B451097E4">
-					<Properties>
-						<string name="Name">Colour</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXD4FA928BBCCD">
-						<Properties>
-							<string name="Name">Oklab</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Colour/Oklab stub
-return {}
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="Folder" referent="RBXBDB479024D98">
-					<Properties>
-						<string name="Name">Dependencies</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXE7CFD58CA3A9">
-						<Properties>
-							<string name="Name">captureDependencies</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Dependencies stub: captureDependencies
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="Folder" referent="87">
+          <Properties>
+            <string name="Name">Dependencies</string>
+          </Properties>
+          <Item class="ModuleScript" referent="88">
+            <Properties>
+              <string name="Name">captureDependencies</string>
+              <string name="Source"><![CDATA[-- Fusion Dependencies stub: captureDependencies
 return function() end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX2FCA6394F29B">
-						<Properties>
-							<string name="Name">initDependency</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Dependencies stub: initDependency
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="89">
+            <Properties>
+              <string name="Name">initDependency</string>
+              <string name="Source"><![CDATA[-- Fusion Dependencies stub: initDependency
 return function() end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXF8735A786D6A">
-						<Properties>
-							<string name="Name">sharedState</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Dependencies stub: sharedState
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="90">
+            <Properties>
+              <string name="Name">sharedState</string>
+              <string name="Source"><![CDATA[-- Fusion Dependencies stub: sharedState
 return function() end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXF7EB23332065">
-						<Properties>
-							<string name="Name">updateAll</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Dependencies stub: updateAll
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="91">
+            <Properties>
+              <string name="Name">updateAll</string>
+              <string name="Source"><![CDATA[-- Fusion Dependencies stub: updateAll
 return function() end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX678861599CC7">
-						<Properties>
-							<string name="Name">useDependency</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Dependencies stub: useDependency
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="92">
+            <Properties>
+              <string name="Name">useDependency</string>
+              <string name="Source"><![CDATA[-- Fusion Dependencies stub: useDependency
 return function() end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="Folder" referent="RBXE8DBDEBA9705">
-					<Properties>
-						<string name="Name">Instances</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXF41813B350ED">
-						<Properties>
-							<string name="Name">Children</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="ModuleScript" referent="93">
+          <Properties>
+            <string name="Name">Instances</string>
+            <string name="Source"><![CDATA[
+-- Fusion Instances module
+local Children = require(script.Children)
+local OnEvent  = require(script.OnEvent)
+local OnChange = require(script.OnChange)
+local Ref      = require(script.Ref)
+local Out      = require(script.Out)
+local Cleanup  = require(script.Cleanup)
+
+local SPECIAL_KEYS = {
+    [Children] = true,
+    [OnEvent]  = true,
+    [OnChange] = true,
+    [Ref]      = true,
+    [Out]      = true,
+    [Cleanup]  = true,
+}
+
+local Instances = {}
+
+local function applyProps(instance, props)
+    local childList = nil
+    for key, value in pairs(props) do
+        if key == Children then
+            childList = value
+        elseif type(key) == "function" then
+            pcall(key, instance, value)
+        elseif type(key) == "string" and key ~= "Parent" then
+            if type(value) == "table" and value.get then
+                pcall(function() (instance :: any)[key] = value:get() end)
+                if value._observers then
+                    local obs = {
+                        _update = function()
+                            pcall(function() (instance :: any)[key] = value:get() end)
+                        end
+                    }
+                    value._observers[obs] = true
+                end
+            else
+                pcall(function() (instance :: any)[key] = value end)
+            end
+        end
+    end
+
+    if childList then
+        local currentChildren = {}
+
+        local function clearChildren()
+            for _, c in ipairs(currentChildren) do
+                if typeof(c) == "Instance" then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+            table.clear(currentChildren)
+        end
+
+        local function applyChildren(list)
+            if type(list) == "table" and list.get then
+                list = list:get()
+            end
+            if type(list) ~= "table" then return end
+            for _, child in ipairs(list) do
+                if typeof(child) == "Instance" then
+                    child.Parent = instance
+                    table.insert(currentChildren, child)
+                elseif type(child) == "table" then
+                    applyChildren(child)
+                end
+            end
+            for k, child in pairs(list) do
+                if type(k) ~= "number" and typeof(child) == "Instance" then
+                    child.Parent = instance
+                    table.insert(currentChildren, child)
+                end
+            end
+        end
+
+        applyChildren(childList)
+
+        if type(childList) == "table" and childList.get and childList._observers then
+            local obs = {
+                _update = function()
+                    clearChildren()
+                    applyChildren(childList)
+                end
+            }
+            childList._observers[obs] = true
+        end
+    end
+
+    -- Set parent last
+    if props.Parent then
+        pcall(function() instance.Parent = props.Parent end)
+    end
+end
+
+
+function Instances.New(className)
+    return function(props)
+        local instance = Instance.new(className)
+        applyProps(instance, props or {})
+        return instance
+    end
+end
+
+function Instances.Hydrate(instance)
+    return function(props)
+        applyProps(instance, props or {})
+        return instance
+    end
+end
+
+Instances.Children = Children
+Instances.OnEvent  = OnEvent
+Instances.OnChange = OnChange
+Instances.Ref      = Ref
+Instances.Out      = Out
+Instances.Cleanup  = Cleanup
+
+return Instances
+]]></string>
+          </Properties>
+          <Item class="ModuleScript" referent="94">
+            <Properties>
+              <string name="Name">Children</string>
+              <string name="Source"><![CDATA[
 local CHILDREN = newproxy(true)
 getmetatable(CHILDREN).__tostring = function() return "Fusion.Children" end
 return CHILDREN
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXE3D5026B117C">
-						<Properties>
-							<string name="Name">Cleanup</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="95">
+            <Properties>
+              <string name="Name">Cleanup</string>
+              <string name="Source"><![CDATA[
 return function(tasks)
     return function()
         if type(tasks) == "table" then
@@ -11583,49 +12766,49 @@ return function(tasks)
         end
     end
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXA4B3A3F315E6">
-						<Properties>
-							<string name="Name">Hydrate</string>
-							<ProtectedString name="Source"><![CDATA[return require(script.Parent).Hydrate]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX520E9ADC0159">
-						<Properties>
-							<string name="Name">New</string>
-							<ProtectedString name="Source"><![CDATA[return require(script.Parent).New]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX392AAA01FD75">
-						<Properties>
-							<string name="Name">OnChange</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="96">
+            <Properties>
+              <string name="Name">Hydrate</string>
+              <string name="Source">return require(script.Parent).Hydrate</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="97">
+            <Properties>
+              <string name="Name">New</string>
+              <string name="Source">return require(script.Parent).New</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="98">
+            <Properties>
+              <string name="Name">OnChange</string>
+              <string name="Source"><![CDATA[
 return function(propertyName)
     return function(instance, callback)
         instance:GetPropertyChangedSignal(propertyName):Connect(callback)
     end
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX5794A240103D">
-						<Properties>
-							<string name="Name">OnEvent</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="99">
+            <Properties>
+              <string name="Name">OnEvent</string>
+              <string name="Source"><![CDATA[
 return function(eventName)
     return function(instance, callback)
         instance[eventName]:Connect(callback)
     end
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXF67C5BDD8BA2">
-						<Properties>
-							<string name="Name">Out</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="100">
+            <Properties>
+              <string name="Name">Out</string>
+              <string name="Source"><![CDATA[
 return function(propertyName)
     return function(instance, outValue)
         if outValue and type(outValue) == "table" and outValue.set then
@@ -11636,13 +12819,13 @@ return function(propertyName)
         end
     end
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX40383C77A7CC">
-						<Properties>
-							<string name="Name">Ref</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="101">
+            <Properties>
+              <string name="Name">Ref</string>
+              <string name="Source"><![CDATA[
 return function(refValue)
     return function(instance)
         if refValue and type(refValue) == "table" and refValue.set then
@@ -11650,89 +12833,100 @@ return function(refValue)
         end
     end
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXFB93026AC969">
-						<Properties>
-							<string name="Name">applyInstanceProps</string>
-							<ProtectedString name="Source"><![CDATA[return require(script.Parent)._applyProps]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX7BAF409946EC">
-						<Properties>
-							<string name="Name">defaultProps</string>
-							<ProtectedString name="Source"><![CDATA[return {}]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="Folder" referent="RBX090239188C7B">
-					<Properties>
-						<string name="Name">Logging</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXC52C78752F27">
-						<Properties>
-							<string name="Name">logError</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Logging stub: logError
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="102">
+            <Properties>
+              <string name="Name">applyInstanceProps</string>
+              <string name="Source">return require(script.Parent)._applyProps</string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="103">
+            <Properties>
+              <string name="Name">defaultProps</string>
+              <string name="Source">return {}</string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="Folder" referent="104">
+          <Properties>
+            <string name="Name">Logging</string>
+          </Properties>
+          <Item class="ModuleScript" referent="105">
+            <Properties>
+              <string name="Name">logError</string>
+              <string name="Source"><![CDATA[-- Fusion Logging stub: logError
 return function(...) warn(...) end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX2E4C685D3BAB">
-						<Properties>
-							<string name="Name">logErrorNonFatal</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Logging stub: logErrorNonFatal
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="106">
+            <Properties>
+              <string name="Name">logErrorNonFatal</string>
+              <string name="Source"><![CDATA[-- Fusion Logging stub: logErrorNonFatal
 return function(...) warn(...) end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXF5441024A80F">
-						<Properties>
-							<string name="Name">logWarn</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Logging stub: logWarn
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="107">
+            <Properties>
+              <string name="Name">logWarn</string>
+              <string name="Source"><![CDATA[-- Fusion Logging stub: logWarn
 return function(...) warn(...) end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX8135DE971DFA">
-						<Properties>
-							<string name="Name">messages</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Logging stub: messages
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="108">
+            <Properties>
+              <string name="Name">messages</string>
+              <string name="Source"><![CDATA[-- Fusion Logging stub: messages
 return function(...) warn(...) end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXD9D9B42EF60A">
-						<Properties>
-							<string name="Name">parseError</string>
-							<ProtectedString name="Source"><![CDATA[-- Fusion Logging stub: parseError
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="109">
+            <Properties>
+              <string name="Name">parseError</string>
+              <string name="Source"><![CDATA[-- Fusion Logging stub: parseError
 return function(...) warn(...) end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="Folder" referent="RBX6D8F9E7E0563">
-					<Properties>
-						<string name="Name">Memory</string>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX5906A63C651B">
-					<Properties>
-						<string name="Name">PubTypes</string>
-						<ProtectedString name="Source"><![CDATA[-- Fusion PubTypes
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="Folder" referent="110">
+          <Properties>
+            <string name="Name">Memory</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="111">
+          <Properties>
+            <string name="Name">PubTypes</string>
+            <string name="Source"><![CDATA[-- Fusion PubTypes
 export type Value<T> = {get: (self: any) -> T, set: (self: any, T) -> ()}
 return {}
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="Folder" referent="RBXA96B25B4C2E7">
-					<Properties>
-						<string name="Name">State</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBX2C00364D7C67">
-						<Properties>
-							<string name="Name">Computed</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="112">
+          <Properties>
+            <string name="Name">State</string>
+            <string name="Source"><![CDATA[
+return {
+    Value    = require(script.Value),
+    Computed = require(script.Computed),
+    Observer = require(script.Observer),
+    ForPairs = require(script.ForPairs),
+    ForKeys  = require(script.ForKeys),
+    ForValues= require(script.ForValues),
+    unwrap   = require(script.unwrap),
+}
+]]></string>
+          </Properties>
+          <Item class="ModuleScript" referent="113">
+            <Properties>
+              <string name="Name">Computed</string>
+              <string name="Source"><![CDATA[
 local Computed = {}
 Computed.__index = Computed
 
@@ -11753,13 +12947,13 @@ mt.__call = function(cls, fn) return cls.new(fn) end
 setmetatable(Computed, mt)
 
 return Computed
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXCCC69DB86363">
-						<Properties>
-							<string name="Name">ForKeys</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="114">
+            <Properties>
+              <string name="Name">ForKeys</string>
+              <string name="Source"><![CDATA[
 return function(stateOrTable, processor, destructor)
     local result = {}
     local src = type(stateOrTable) == "table" and stateOrTable.get and stateOrTable:get() or stateOrTable
@@ -11771,13 +12965,13 @@ return function(stateOrTable, processor, destructor)
     end
     return result
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXED8159CC2EB5">
-						<Properties>
-							<string name="Name">ForPairs</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="115">
+            <Properties>
+              <string name="Name">ForPairs</string>
+              <string name="Source"><![CDATA[
 return function(stateOrTable, processor, destructor)
     -- Returns a reactive table-like object; simplified for compatibility
     local result = {}
@@ -11790,13 +12984,13 @@ return function(stateOrTable, processor, destructor)
     end
     return result
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXB25D47BF30D1">
-						<Properties>
-							<string name="Name">ForValues</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="116">
+            <Properties>
+              <string name="Name">ForValues</string>
+              <string name="Source"><![CDATA[
 return function(stateOrTable, processor, destructor)
     local result = {}
     local src = type(stateOrTable) == "table" and stateOrTable.get and stateOrTable:get() or stateOrTable
@@ -11808,13 +13002,13 @@ return function(stateOrTable, processor, destructor)
     end
     return result
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX7BAC4AAF21CD">
-						<Properties>
-							<string name="Name">Observer</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="117">
+            <Properties>
+              <string name="Name">Observer</string>
+              <string name="Source"><![CDATA[
 local Observer = {}
 Observer.__index = Observer
 
@@ -11827,10 +13021,12 @@ function Observer.new(watchedState)
 end
 
 function Observer:_update()
+    local val = self._state and self._state:get()
     for _, cb in ipairs(self._callbacks) do
-        task.spawn(cb)
+        task.spawn(cb, val)
     end
 end
+
 
 function Observer:onChange(callback)
     table.insert(self._callbacks, callback)
@@ -11851,13 +13047,13 @@ mt.__call = function(cls, state) return cls.new(state) end
 setmetatable(Observer, mt)
 
 return Observer
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX656E4F4D1337">
-						<Properties>
-							<string name="Name">Value</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="118">
+            <Properties>
+              <string name="Name">Value</string>
+              <string name="Source"><![CDATA[
 local Value = {}
 Value.__index = Value
 
@@ -11884,49 +13080,60 @@ mt.__call = function(cls, v) return cls.new(v) end
 setmetatable(Value, mt)
 
 return Value
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX224ED11248E6">
-						<Properties>
-							<string name="Name">unwrap</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="119">
+            <Properties>
+              <string name="Name">unwrap</string>
+              <string name="Source"><![CDATA[
 return function(value)
     if type(value) == "table" and value.get then
         return value:get()
     end
     return value
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-				<Item class="ModuleScript" referent="RBX9C9F667D17B5">
-					<Properties>
-						<string name="Name">Types</string>
-						<ProtectedString name="Source"><![CDATA[-- Fusion Types
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="ModuleScript" referent="120">
+          <Properties>
+            <string name="Name">Types</string>
+            <string name="Source"><![CDATA[-- Fusion Types
 return {}
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="Folder" referent="RBX49C5B42595FA">
-					<Properties>
-						<string name="Name">Utility</string>
-					</Properties>
-					<Item class="ModuleScript" referent="RBXB623A0592A30">
-						<Properties>
-							<string name="Name">None</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="121">
+          <Properties>
+            <string name="Name">Utility</string>
+            <string name="Source"><![CDATA[
+return {
+    None            = require(script.None),
+    cleanup         = require(script.cleanup),
+    doNothing       = require(script.doNothing),
+    isSimilar       = require(script.isSimilar),
+    needsDestruction= require(script.needsDestruction),
+    restrictRead    = require(script.restrictRead),
+    xtypeof         = require(script.xtypeof),
+}
+]]></string>
+          </Properties>
+          <Item class="ModuleScript" referent="122">
+            <Properties>
+              <string name="Name">None</string>
+              <string name="Source"><![CDATA[
 local None = newproxy(true)
 getmetatable(None).__tostring = function() return "Fusion.None" end
 return None
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX81415B4742F4">
-						<Properties>
-							<string name="Name">cleanup</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="123">
+            <Properties>
+              <string name="Name">cleanup</string>
+              <string name="Source"><![CDATA[
 return function(task_)
     if type(task_) == "function" then task_()
     elseif typeof(task_) == "RBXScriptConnection" then task_:Disconnect()
@@ -11935,40 +13142,40 @@ return function(task_)
         for _, t in ipairs(task_) do require(script)(t) end
     end
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBXE2D0E216B042">
-						<Properties>
-							<string name="Name">doNothing</string>
-							<ProtectedString name="Source"><![CDATA[return function() end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX81280F870F9D">
-						<Properties>
-							<string name="Name">isSimilar</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="124">
+            <Properties>
+              <string name="Name">doNothing</string>
+              <string name="Source"><![CDATA[return function() end
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="125">
+            <Properties>
+              <string name="Name">isSimilar</string>
+              <string name="Source"><![CDATA[
 return function(a, b)
     return a == b
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX91D5E0B71CA2">
-						<Properties>
-							<string name="Name">needsDestruction</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="126">
+            <Properties>
+              <string name="Name">needsDestruction</string>
+              <string name="Source"><![CDATA[
 return function(value)
     return typeof(value) == "Instance"
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX9E3A8DE1360E">
-						<Properties>
-							<string name="Name">restrictRead</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="127">
+            <Properties>
+              <string name="Name">restrictRead</string>
+              <string name="Source"><![CDATA[
 return function(t, name)
     return setmetatable({}, {
         __index = t,
@@ -11977,13 +13184,13 @@ return function(t, name)
         end,
     })
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-					<Item class="ModuleScript" referent="RBX9A658963566D">
-						<Properties>
-							<string name="Name">xtypeof</string>
-							<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="128">
+            <Properties>
+              <string name="Name">xtypeof</string>
+              <string name="Source"><![CDATA[
 return function(value)
     local t = typeof(value)
     if t == "table" then
@@ -11994,15 +13201,15 @@ return function(value)
     end
     return t
 end
-]]></ProtectedString>
-						</Properties>
-					</Item>
-				</Item>
-			</Item>
-			<Item class="ModuleScript" referent="RBX017B626F869B">
-				<Properties>
-					<string name="Name">Promise</string>
-					<ProtectedString name="Source"><![CDATA[
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="129">
+        <Properties>
+          <string name="Name">Promise</string>
+          <string name="Source"><![CDATA[
 -- Promise 4.0.0 (minimal compatible version)
 -- https://github.com/evaera/roblox-lua-promise
 local Promise = {}
@@ -12114,18 +13321,18 @@ function Promise:await()
 end
 
 return Promise
-]]></ProtectedString>
-				</Properties>
-			</Item>
-		</Item>
-		<Item class="Folder" referent="RBXA6237ABD2C2E">
-			<Properties>
-				<string name="Name">Services</string>
-			</Properties>
-			<Item class="ModuleScript" referent="RBXDC3B4CB9F4C5">
-				<Properties>
-					<string name="Name">AnimationManager</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="130">
+      <Properties>
+        <string name="Name">Services</string>
+      </Properties>
+      <Item class="ModuleScript" referent="131">
+        <Properties>
+          <string name="Name">AnimationManager</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -13600,13 +14807,13 @@ return AnimationManager
 
 
 
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX7EC89B0C56C7">
-				<Properties>
-					<string name="Name">BlenderSyncManager</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="132">
+        <Properties>
+          <string name="Name">BlenderSyncManager</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -13930,13 +15137,13 @@ return BlenderSyncManager
 
 
 
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBXD42FEFAC3224">
-				<Properties>
-					<string name="Name">CameraManager</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="133">
+        <Properties>
+          <string name="Name">CameraManager</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -14038,13 +15245,13 @@ function CameraManager:cleanup()
 end
 
 return CameraManager
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBXB43D8209723A">
-				<Properties>
-					<string name="Name">ExportManager</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="134">
+        <Properties>
+          <string name="Name">ExportManager</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -15434,13 +16641,13 @@ function ExportManager:exportRigLegacy()
 end
 
 return ExportManager
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBXA88BEE84C10D">
-				<Properties>
-					<string name="Name">PlaybackService</string>
-					<ProtectedString name="Source"><![CDATA[--!strict
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="135">
+        <Properties>
+          <string name="Name">PlaybackService</string>
+          <string name="Source"><![CDATA[--!strict
 -- I moved all the playback logic here to make it easier to manage.
 local PlaybackService = {}
 PlaybackService.__index = PlaybackService
@@ -15948,13 +17155,13 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 end
 
 return PlaybackService
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX88F01BA33095">
-				<Properties>
-					<string name="Name">RigManager</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="136">
+        <Properties>
+          <string name="Name">RigManager</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -16526,6 +17733,14 @@ function RigManager:toggleDecal(targetDecalName: string)
 	end
 end
 
+function RigManager:setAllDecals(visible: boolean)
+	local decals = State.activeDecals:get()
+	local transparency = visible and 0 or 1
+	for _, decal in pairs(decals) do
+		decal.Transparency = transparency
+	end
+end
+
 
 -- Sync missing bones from the selected Blender armature into the current Studio rig.
 -- If the active rig is Motor6D-based, creates a placeholder Part and a Motor6D under the resolved parent part.
@@ -16757,22 +17972,22 @@ function RigManager:syncBones(blenderSyncManager: any?): boolean
 end
 
 return RigManager
-]]></ProtectedString>
-				</Properties>
-			</Item>
-		</Item>
-		<Item class="Folder" referent="RBXC14DECB15D32">
-			<Properties>
-				<string name="Name">UI</string>
-			</Properties>
-			<Item class="Folder" referent="RBX64F29C4B707C">
-				<Properties>
-					<string name="Name">Components</string>
-				</Properties>
-				<Item class="ModuleScript" referent="RBXBB9699CE84E3">
-					<Properties>
-						<string name="Name">AnimationImportControls</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="137">
+      <Properties>
+        <string name="Name">UI</string>
+      </Properties>
+      <Item class="Folder" referent="138">
+        <Properties>
+          <string name="Name">Components</string>
+        </Properties>
+        <Item class="ModuleScript" referent="139">
+          <Properties>
+            <string name="Name">AnimationImportControls</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -16834,13 +18049,13 @@ local function createLegacyImportSection(services: any, layoutOrder: number, sel
 					if State.importScript then
 						State.importScript:Destroy()
 					end
-					local plugin = script:FindFirstAncestorWhichIsA("Plugin")
+					local pluginInstance = (typeof(plugin) == "Instance" and plugin) or script:FindFirstAncestorWhichIsA("Plugin")
 					State.importScript = Instance.new("Script", game.Workspace)
 					assert(State.importScript)
 					State.importScript.Archivable = false
 					State.importScript.Source = "-- " .. importScriptText .. "\n"
-					if plugin then
-						plugin:OpenScript(State.importScript, 2)
+					if pluginInstance then
+						pluginInstance:OpenScript(State.importScript, 2)
 					end
 					local tempConnection: RBXScriptConnection
 					tempConnection = State.importScript.Changed:Connect(function(prop)
@@ -17384,13 +18599,13 @@ function AnimationImportControls.create(services: any, layoutOrder: number?)
 end
 
 return AnimationImportControls
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXA3CEB370492B">
-					<Properties>
-						<string name="Name">BoneToggles</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="140">
+          <Properties>
+            <string name="Name">BoneToggles</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -17819,13 +19034,13 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 end
 
 return BoneToggles
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX9DE6A4869AB2">
-					<Properties>
-						<string name="Name">CameraControls</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="141">
+          <Properties>
+            <string name="Name">CameraControls</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -17931,13 +19146,13 @@ function CameraControls.createCameraControlsUI(services: any)
 end
 
 return CameraControls
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX6DBD4490B20E">
-					<Properties>
-						<string name="Name">DecalControls</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="142">
+          <Properties>
+            <string name="Name">DecalControls</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -17945,11 +19160,11 @@ local State = require(script.Parent.Parent.Parent.state)
 local Fusion = require(script.Parent.Parent.Parent.Packages.Fusion)
 
 local New = Fusion.New
-local Value = Fusion.Value
-local Computed = Fusion.Computed
-local ForPairs = Fusion.ForPairs
-local OnEvent = Fusion.OnEvent
 local Children = Fusion.Children
+local Computed = Fusion.Computed
+local Value = Fusion.Value
+local OnEvent = Fusion.OnEvent
+local Observer = Fusion.Observer
 
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -17957,265 +19172,211 @@ local themeProvider = require(StudioComponentsUtil.themeProvider)
 local Label = require(StudioComponents.Label)
 local Button = require(StudioComponents.Button)
 local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
-local Slider = require(StudioComponents.Slider)
 
 local DecalControls = {}
 
-function DecalControls.createDecalControlsUI(services: any, layoutOrder: number?)
-	local isCollapsed = Value(false)
-
-	local hasDecals = Computed(function()
-		local names = State.decalNames:get()
-		return #names > 0
-	end)
-
-	local decalStatusText = Computed(function()
-		local names = State.decalNames:get()
-		if #names == 0 then
-			return "No Decals found on Head."
-		else
-			return string.format("Found %d Head Decal expression(s):", #names)
+-- Safely call rigManager methods
+local function callRigManager(method: string, ...)
+	local rm = State.rigManager
+	if rm and type(rm[method]) == "function" then
+		local ok, err = pcall(rm[method], rm, ...)
+		if not ok then
+			warn("[DecalControls] rigManager:" .. method .. " error: " .. tostring(err))
 		end
-	end)
+	end
+end
 
-	-- Grid of Quick Toggle buttons (Independent Layers)
-	local expressionButtons = ForPairs(State.decalNames, function(index: number, decalName: string)
-		local shortName = string.gsub(decalName, "Face%.", "F.")
+-- Creates the scrollable grid of decal buttons dynamically
+local function buildDecalButtons(container: Frame, services: any)
+	-- clear existing
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("TextButton") or child:IsA("UIGridLayout") then
+			child:Destroy()
+		end
+	end
+
+	local names = State.decalNames:get()
+	if #names == 0 then
+		return
+	end
+
+	-- Grid layout
+	local grid = Instance.new("UIGridLayout")
+	grid.CellPadding = UDim2.new(0, 4, 0, 4)
+	grid.CellSize = UDim2.new(0, 52, 0, 24)
+	grid.FillDirection = Enum.FillDirection.Horizontal
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	grid.Parent = container
+
+	for i, decalName in ipairs(names) do
+		-- shorten the label: "Face.1" -> "F.1", else first 5 chars
+		local shortName = decalName:gsub("Face%.", "F.")
 		if shortName == decalName then
-			shortName = string.sub(decalName, 1, 4)
+			shortName = decalName:sub(1, 5)
 		end
 
-		local btn = New("TextButton")({
-			LayoutOrder = index,
-			Size = UDim2.new(0, 44, 0, 24),
-			BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainButton),
-			TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText),
-			Font = Enum.Font.GothamSemibold,
-			TextSize = 11,
-			Text = shortName,
-			BorderSizePixel = 0,
-			[Children] = {
-				New("UICorner")({
-					CornerRadius = UDim.new(0, 4),
-				}),
-			},
-			[OnEvent("Activated")] = function()
-				if services and services.rigManager then
-					services.rigManager:toggleDecal(decalName)
-				end
-			end,
-		})
+		local isActive = State.activeDecals:get()[decalName] ~= false
 
-		return index, btn
-	end, Fusion.cleanup)
+		local btn = Instance.new("TextButton")
+		btn.LayoutOrder = i
+		btn.Size = UDim2.new(0, 52, 0, 24)
+		btn.BackgroundColor3 = isActive
+			and Color3.fromRGB(0, 120, 212)   -- blue = ON
+			or themeProvider:GetColor(Enum.StudioStyleGuideColor.MainButton)
+		btn.TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText)
+		btn.Font = Enum.Font.GothamSemibold
+		btn.TextSize = 11
+		btn.Text = shortName
+		btn.BorderSizePixel = 0
+		btn.AutoButtonColor = false
 
-	-- Sliders per decal
-	local decalSliders = ForPairs(State.decalNames, function(index: number, decalName: string)
-		local currentTransparency = Value(0)
-		local decals = State.activeDecals:get()
-		local d = decals[decalName]
-		if d then
-			currentTransparency:set(d.Transparency)
-		end
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 4)
+		corner.Parent = btn
 
-		local sliderRow = New("Frame")({
-			LayoutOrder = index,
-			Size = UDim2.new(1, 0, 0, 36),
-			BackgroundTransparency = 1,
-			[Children] = {
-				New("UIListLayout")({
-					SortOrder = Enum.SortOrder.LayoutOrder,
-					Padding = UDim.new(0, 2),
-				}),
-				New("Frame")({
-					Size = UDim2.new(1, 0, 0, 16),
-					BackgroundTransparency = 1,
-					LayoutOrder = 1,
-					[Children] = {
-						Label({
-							Text = decalName,
-							Size = UDim2.new(0.6, 0, 1, 0),
-							TextXAlignment = Enum.TextXAlignment.Left,
-						}),
-						New("TextButton")({
-							Size = UDim2.new(0, 44, 1, 0),
-							Position = UDim2.new(1, -44, 0, 0),
-							BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Button),
-							Text = "Solo",
-							TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.ButtonText),
-							Font = Enum.Font.Gotham,
-							TextSize = 10,
-							BorderSizePixel = 0,
-							[Children] = {
-								New("UICorner")({ CornerRadius = UDim.new(0, 3) }),
-							},
-							[OnEvent("Activated")] = function()
-								if services and services.rigManager then
-									services.rigManager:soloDecal(decalName)
-								end
-							end,
-						}),
-					},
-				}),
-				Slider({
-					LayoutOrder = 2,
-					Value = currentTransparency,
-					Min = 0,
-					Max = 1,
-					Step = 0.05,
-					OnChange = function(val: number)
-						if services and services.rigManager then
-							services.rigManager:setDecalTransparency(decalName, val)
-						end
-					end,
-				}),
-			},
-		})
+		btn.MouseButton1Click:Connect(function()
+			callRigManager("toggleDecal", decalName)
+			-- update button color immediately
+			local nowActive = State.activeDecals:get()[decalName] ~= false
+			btn.BackgroundColor3 = nowActive
+				and Color3.fromRGB(0, 120, 212)
+				or themeProvider:GetColor(Enum.StudioStyleGuideColor.MainButton)
+		end)
 
-		return index, sliderRow
-	end, Fusion.cleanup)
+		btn.Parent = container
+	end
+end
 
-	return VerticalCollapsibleSection({
-		LayoutOrder = layoutOrder or 3,
-		Collapsed = isCollapsed,
-		Title = "🎭 Decal Expressions & Layers",
+function DecalControls.createDecalControlsUI(services: any, layoutOrder: number?)
+
+	-- Inner scrollable frame that holds the buttons
+	local buttonsFrame = New("Frame")({
+		Name = "DecalButtonsGrid",
+		Size = UDim2.new(1, -16, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+	})
+
+	-- Action buttons row
+	local function makeActionBtn(text: string, lo: number, onClick: () -> ())
+		local b = Instance.new("TextButton")
+		b.LayoutOrder = lo
+		b.Size = UDim2.new(0, 80, 0, 22)
+		b.Text = text
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 11
+		b.BorderSizePixel = 0
+		b.BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainButton)
+		b.TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText)
+		b.AutoButtonColor = true
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 4)
+		c.Parent = b
+		b.MouseButton1Click:Connect(onClick)
+		return b
+	end
+
+	local actionsRow = New("Frame")({
+		Name = "DecalActions",
+		LayoutOrder = 3,
+		Size = UDim2.new(1, -16, 0, 30),
+		BackgroundTransparency = 1,
 		[Children] = {
-			New("Frame")({
-				Size = UDim2.new(1, 0, 0, 0),
-				AutomaticSize = Enum.AutomaticSize.Y,
-				BackgroundTransparency = 1,
-				[Children] = {
-					New("UIListLayout")({
-						SortOrder = Enum.SortOrder.LayoutOrder,
-						Padding = UDim.new(0, 6),
-					}),
-					New("UIPadding")({
-						PaddingTop = UDim.new(0, 4),
-						PaddingBottom = UDim.new(0, 4),
-						PaddingLeft = UDim.new(0, 4),
-						PaddingRight = UDim.new(0, 4),
-					}),
-					-- Status & Rescan Row
-					New("Frame")({
-						Size = UDim2.new(1, 0, 0, 24),
-						BackgroundTransparency = 1,
-						LayoutOrder = 1,
-						[Children] = {
-							Label({
-								Text = decalStatusText,
-								Size = UDim2.new(1, -60, 1, 0),
-								TextXAlignment = Enum.TextXAlignment.Left,
-							}),
-							New("TextButton")({
-								Size = UDim2.new(0, 56, 1, 0),
-								Position = UDim2.new(1, -56, 0, 0),
-								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Button),
-								Text = "Rescan",
-								TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.ButtonText),
-								Font = Enum.Font.Gotham,
-								TextSize = 11,
-								BorderSizePixel = 0,
-								[Children] = {
-									New("UICorner")({ CornerRadius = UDim.new(0, 4) }),
-								},
-								[OnEvent("Activated")] = function()
-									if services and services.rigManager then
-										services.rigManager:scanRigDecals(State.activeRigModel)
-									end
-								end,
-							}),
-						},
-					}),
-					-- Quick Action Buttons (Ligar / Desligar Todos)
-					New("Frame")({
-						Size = UDim2.new(1, 0, 0, 24),
-						BackgroundTransparency = 1,
-						LayoutOrder = 2,
-						Visible = hasDecals,
-						[Children] = {
-							New("TextButton")({
-								Size = UDim2.new(0.48, 0, 1, 0),
-								Position = UDim2.new(0, 0, 0, 0),
-								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Button),
-								Text = "Ligar Todos",
-								TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.ButtonText),
-								Font = Enum.Font.Gotham,
-								TextSize = 10,
-								BorderSizePixel = 0,
-								[Children] = { New("UICorner")({ CornerRadius = UDim.new(0, 4) }) },
-								[OnEvent("Activated")] = function()
-									if services and services.rigManager then
-										for _, name in ipairs(State.decalNames:get()) do
-											services.rigManager:setDecalTransparency(name, 0)
-										end
-									end
-								end,
-							}),
-							New("TextButton")({
-								Size = UDim2.new(0.48, 0, 1, 0),
-								Position = UDim2.new(0.52, 0, 0, 0),
-								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Button),
-								Text = "Desligar Todos",
-								TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.ButtonText),
-								Font = Enum.Font.Gotham,
-								TextSize = 10,
-								BorderSizePixel = 0,
-								[Children] = { New("UICorner")({ CornerRadius = UDim.new(0, 4) }) },
-								[OnEvent("Activated")] = function()
-									if services and services.rigManager then
-										for _, name in ipairs(State.decalNames:get()) do
-											services.rigManager:setDecalTransparency(name, 1)
-										end
-									end
-								end,
-							}),
-						},
-					}),
-					-- Expression Buttons Grid
-					New("Frame")({
-						Size = UDim2.new(1, 0, 0, 0),
-						AutomaticSize = Enum.AutomaticSize.Y,
-						BackgroundTransparency = 1,
-						LayoutOrder = 3,
-						Visible = hasDecals,
-						[Children] = {
-							New("UIGridLayout")({
-								CellSize = UDim2.new(0, 44, 0, 24),
-								CellPadding = UDim2.new(0, 4, 0, 4),
-								SortOrder = Enum.SortOrder.LayoutOrder,
-							}),
-							expressionButtons,
-						},
-					}),
-					-- Sliders
-					New("Frame")({
-						Size = UDim2.new(1, 0, 0, 0),
-						AutomaticSize = Enum.AutomaticSize.Y,
-						BackgroundTransparency = 1,
-						LayoutOrder = 4,
-						Visible = hasDecals,
-						[Children] = {
-							New("UIListLayout")({
-								SortOrder = Enum.SortOrder.LayoutOrder,
-								Padding = UDim.new(0, 4),
-							}),
-							decalSliders,
-						},
-					}),
-				},
+			New("UIListLayout")({
+				FillDirection = Enum.FillDirection.Horizontal,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+				Padding = UDim.new(0, 6),
+				SortOrder = Enum.SortOrder.LayoutOrder,
 			}),
+			makeActionBtn("All ON", 1, function()
+				callRigManager("setAllDecals", true)
+			end),
+			makeActionBtn("All OFF", 2, function()
+				callRigManager("setAllDecals", false)
+			end),
+			makeActionBtn("Rescan", 3, function()
+				if State.activeRigModel then
+					callRigManager("scanRigDecals", State.activeRigModel)
+				end
+			end),
 		},
 	})
+
+	local statusLabel = New("TextLabel")({
+		LayoutOrder = 1,
+		Size = UDim2.new(1, -16, 0, 20),
+		BackgroundTransparency = 1,
+		TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.SubText),
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = Computed(function()
+			local names = State.decalNames:get()
+			if #names == 0 then
+				return "No Decals found on Head. Select a rig."
+			end
+			return string.format("Found %d Head Decal(s):", #names)
+		end),
+	})
+
+	local inner = New("Frame")({
+		Name = "DecalInner",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		[Children] = {
+			New("UIListLayout")({
+				FillDirection = Enum.FillDirection.Vertical,
+				Padding = UDim.new(0, 4),
+				SortOrder = Enum.SortOrder.LayoutOrder,
+			}),
+			New("UIPadding")({
+				PaddingLeft = UDim.new(0, 8),
+				PaddingRight = UDim.new(0, 8),
+				PaddingTop = UDim.new(0, 4),
+				PaddingBottom = UDim.new(0, 4),
+			}),
+			statusLabel,
+			buttonsFrame,
+			actionsRow,
+		},
+	})
+
+	-- Build buttons initially
+	task.defer(function()
+		pcall(buildDecalButtons, buttonsFrame, services)
+	end)
+
+	-- Re-build buttons whenever decalNames changes
+	local disconnectObserver: (() -> ())?
+	if Observer and type(Observer) == "function" then
+		local obs = Observer(State.decalNames)
+		disconnectObserver = obs:onChange(function()
+			task.defer(function()
+				pcall(buildDecalButtons, buttonsFrame, services)
+			end)
+		end)
+	end
+
+	local section = VerticalCollapsibleSection({
+		Text = "Decal Expressions",
+		Collapsed = false,
+		LayoutOrder = layoutOrder or 3,
+		[Children] = { inner },
+	})
+
+	return section
 end
 
 return DecalControls
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXCC0867095F92">
-					<Properties>
-						<string name="Name">ExportBoneToggles</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="143">
+          <Properties>
+            <string name="Name">ExportBoneToggles</string>
+            <string name="Source">--!native
 --!strict
 --!optimize 2
 
@@ -18543,13 +19704,13 @@ function ExportBoneToggles.create(services: any, layoutOrder: number?)
 	return section
 end
 
-return ExportBoneToggles]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX4DF3FB801DDF">
-					<Properties>
-						<string name="Name">KeyframeNaming</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+return ExportBoneToggles</string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="144">
+          <Properties>
+            <string name="Name">KeyframeNaming</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -18733,13 +19894,13 @@ function KeyframeNaming.createKeyframeNamingUI(services: any, layoutOrder: numbe
 end
 
 return KeyframeNaming
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXF96935FE2E72">
-					<Properties>
-						<string name="Name">PlaybackControls</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="145">
+          <Properties>
+            <string name="Name">PlaybackControls</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -19214,13 +20375,13 @@ function PlaybackControls.createHeaderPlayback(services: any, layoutOrder: numbe
 end
 
 return PlaybackControls
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX017DE54EA4F9">
-					<Properties>
-						<string name="Name">PlaybackSlider</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="146">
+          <Properties>
+            <string name="Name">PlaybackSlider</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -19421,14 +20582,14 @@ function PlaybackSlider.create(props: {
 end
 
 return PlaybackSlider
-]]></ProtectedString>
-					</Properties>
-				</Item>
-			</Item>
-			<Item class="ModuleScript" referent="RBXDD56C7CC1A50">
-				<Properties>
-					<string name="Name">SharedComponents</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="147">
+        <Properties>
+          <string name="Name">SharedComponents</string>
+          <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -19617,23 +20778,24 @@ function SharedComponents.createHeaderUI(services: any?)
 end
 
 return SharedComponents
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="Folder" referent="RBX169CB633757E">
-				<Properties>
-					<string name="Name">Tabs</string>
-				</Properties>
-				<Item class="ModuleScript" referent="RBXC323AA2C13E4">
-					<Properties>
-						<string name="Name">BlenderSyncTab</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="148">
+        <Properties>
+          <string name="Name">Tabs</string>
+        </Properties>
+        <Item class="ModuleScript" referent="149">
+          <Properties>
+            <string name="Name">BlenderSyncTab</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
 local State = require(script.Parent.Parent.Parent.state)
 local Fusion = require(script.Parent.Parent.Parent.Packages.Fusion)
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
+local internal = script:FindFirstAncestor("BlenderAnimationsInternal") or script:FindFirstAncestorWhichIsA("Plugin") or script.Parent.Parent.Parent
+local Plugin = internal
 
 local New = Fusion.New
 local Children = Fusion.Children
@@ -20054,13 +21216,13 @@ function BlenderSyncTab.create(services: any)
 end
 
 return BlenderSyncTab
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBXCB371CAA7F48">
-					<Properties>
-						<string name="Name">MoreTab</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="150">
+          <Properties>
+            <string name="Name">MoreTab</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -20432,13 +21594,13 @@ function MoreTab.create(services: any)
 end
 
 return MoreTab
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX9A38195B2F37">
-					<Properties>
-						<string name="Name">PlayerTab</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="151">
+          <Properties>
+            <string name="Name">PlayerTab</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -20841,13 +22003,13 @@ function PlayerTab.create(services: any)
 end
 
 return PlayerTab
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX6B0445296083">
-					<Properties>
-						<string name="Name">RiggingTab</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="152">
+          <Properties>
+            <string name="Name">RiggingTab</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -21391,13 +22553,13 @@ function RiggingTab.create(services: any)
 end
 
 return RiggingTab
-]]></ProtectedString>
-					</Properties>
-				</Item>
-				<Item class="ModuleScript" referent="RBX4970BF18A54C">
-					<Properties>
-						<string name="Name">ToolsTab</string>
-						<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="153">
+          <Properties>
+            <string name="Name">ToolsTab</string>
+            <string name="Source"><![CDATA[--!native
 --!strict
 --!optimize 2
 
@@ -21666,15 +22828,15 @@ function ToolsTab.create(services: any)
 end
 
 return ToolsTab
-]]></ProtectedString>
-					</Properties>
-				</Item>
-			</Item>
-		</Item>
-		<Item class="ModuleScript" referent="RBXF98C533A5F18">
-			<Properties>
-				<string name="Name">Utils</string>
-				<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="154">
+      <Properties>
+        <string name="Name">Utils</string>
+        <string name="Source"><![CDATA[--!native
 --!strict
 
 local Utils = {}
@@ -21715,13 +22877,13 @@ function Utils.getRealKeyframeDuration(keyframes: { Instance })
 	return totalTime
 end
 
-return Utils ]]></ProtectedString>
-			</Properties>
-		</Item>
-		<Item class="ModuleScript" referent="RBXE07DEECE10FD">
-			<Properties>
-				<string name="Name">state</string>
-				<ProtectedString name="Source"><![CDATA[--!native
+return Utils ]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="155">
+      <Properties>
+        <string name="Name">state</string>
+        <string name="Source"><![CDATA[--!native
 --!strict
 
 local Fusion = require(script.Parent.Packages.Fusion)
@@ -21867,17 +23029,17 @@ State.displayWarnings = Computed(function()
 end)
 
 return State 
-]]></ProtectedString>
-			</Properties>
-		</Item>
-		<Item class="Folder" referent="RBX5146F35CDFAD">
-			<Properties>
-				<string name="Name">tests</string>
-			</Properties>
-			<Item class="ModuleScript" referent="RBX067A3584B5D3">
-				<Properties>
-					<string name="Name">AnimationManager.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="156">
+      <Properties>
+        <string name="Name">tests</string>
+      </Properties>
+      <Item class="ModuleScript" referent="157">
+        <Properties>
+          <string name="Name">AnimationManager.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local AnimationManager = require(script.Parent.Parent.Services.AnimationManager)
 
 	local sampleAxisValue = AnimationManager._testing.sampleAxisValue
@@ -22231,13 +23393,13 @@ return State
 		end)
 	end)
 end
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX60E4111A3F4E">
-				<Properties>
-					<string name="Name">AnimationSerializer.spec</string>
-					<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="158">
+        <Properties>
+          <string name="Name">AnimationSerializer.spec</string>
+          <string name="Source">--!native
 --!strict
 
 --[[
@@ -22547,13 +23709,13 @@ return function()
 			end)
 		end)
 	end)
-end]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX9C21860D42CF">
-				<Properties>
-					<string name="Name">BaseXX.spec</string>
-					<ProtectedString name="Source"><![CDATA[--!nolint
+end</string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="159">
+        <Properties>
+          <string name="Name">BaseXX.spec</string>
+          <string name="Source"><![CDATA[--!nolint
 return function()
 	local testez = require(script.Parent.Parent.Components.testez)
 	local basexx = require(script.Parent.Parent.Components.BaseXX)
@@ -22587,13 +23749,13 @@ return function()
 			expect(decoded).to.equal(originalstring)
 		end)
 	end)
-end ]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX5037F997FB48">
-				<Properties>
-					<string name="Name">BlenderConnection.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+end ]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="160">
+        <Properties>
+          <string name="Name">BlenderConnection.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local testez = require(script.Parent.Parent.Components.testez)
 	local BlenderConnection = require(script.Parent.Parent.Components.BlenderConnection)
 
@@ -22750,13 +23912,13 @@ end ]]></ProtectedString>
 			end)
 		end)
 	end)
-end ]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX9749B577D4EC">
-				<Properties>
-					<string name="Name">DeflateLua.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+end ]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="161">
+        <Properties>
+          <string name="Name">DeflateLua.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local testez = require(script.Parent.Parent.Components.testez)
 	local deflatelua = require(script.Parent.Parent.Components.DeflateLua)
 
@@ -22780,13 +23942,13 @@ end ]]></ProtectedString>
 			expect(decompressed_data).to.equal(expected_decompressed)
 		end)
 	end)
-end ]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX0A4AA65A7A3A">
-				<Properties>
-					<string name="Name">ExportManager.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+end ]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="162">
+        <Properties>
+          <string name="Name">ExportManager.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local ExportManager = require(script.Parent.Parent.Services.ExportManager)
 	local State = require(script.Parent.Parent.state)
 
@@ -23213,13 +24375,13 @@ end ]]></ProtectedString>
 		end)
 	end)
 end
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX3F0D86DE8126">
-				<Properties>
-					<string name="Name">PlaybackService.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="163">
+        <Properties>
+          <string name="Name">PlaybackService.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local State = require(script.Parent.Parent.state)
 	local PlaybackService = require(script.Parent.Parent.Services.PlaybackService)
 	local Types = require(script.Parent.Parent.types)
@@ -23800,13 +24962,13 @@ end
 		end)
 	end)
 end
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX6FF3B30FDC6E">
-				<Properties>
-					<string name="Name">Rig.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="164">
+        <Properties>
+          <string name="Name">Rig.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local testez = require(script.Parent.Parent.Components.testez)
 	local rig_module = require(script.Parent.Parent.Components.Rig)
 	local RigManager = require(script.Parent.Parent.Services.RigManager)
@@ -25377,13 +26539,13 @@ end
 			end)
 		end)
 	end)
-end ]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX784AE8F44C9C">
-				<Properties>
-					<string name="Name">RigPart.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+end ]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="165">
+        <Properties>
+          <string name="Name">RigPart.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local RigPart = require(script.Parent.Parent.Components.RigPart)
 
 	describe("RigPart", function()
@@ -26305,13 +27467,13 @@ end ]]></ProtectedString>
 		end)
 	end)
 end
-]]></ProtectedString>
-				</Properties>
-			</Item>
-			<Item class="ModuleScript" referent="RBX73AEE20A7263">
-				<Properties>
-					<string name="Name">Utils.spec</string>
-					<ProtectedString name="Source"><![CDATA[return function()
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="166">
+        <Properties>
+          <string name="Name">Utils.spec</string>
+          <string name="Source"><![CDATA[return function()
 	local Utils = require(script.Parent.Parent.Utils)
 
 	describe("Utils", function()
@@ -26589,14 +27751,14 @@ end
 		end)
 	end)
 end
-]]></ProtectedString>
-				</Properties>
-			</Item>
-		</Item>
-		<Item class="ModuleScript" referent="RBX2C179FB8A66A">
-			<Properties>
-				<string name="Name">types</string>
-				<ProtectedString name="Source"><![CDATA[--!native
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="167">
+      <Properties>
+        <string name="Name">types</string>
+        <string name="Source"><![CDATA[--!native
 --!strict
 
 -- Type definitions for the new type solver
@@ -26702,8 +27864,8 @@ export type State = {
 	lastKnownBlenderTimestamp: any,
 }
 
-return {} ]]></ProtectedString>
-			</Properties>
-		</Item>
-	</Item>
+return {} ]]></string>
+      </Properties>
+    </Item>
+  </Item>
 </roblox>

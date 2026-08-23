@@ -61,6 +61,16 @@ from .auth_ops import (
     OBJECT_OT_RbxOAuthCancelLogin,
     OBJECT_OT_RbxOAuthLogout,
 )
+from .decal_ops import (
+    OBJECT_OT_RbxDecalScan,
+    OBJECT_OT_RbxDecalImportImages,
+    OBJECT_OT_RbxDecalSolo,
+    OBJECT_OT_RbxDecalQuickSwitch,
+    OBJECT_OT_RbxDecalKeyframe,
+    OBJECT_OT_RbxDecalClearKeyframes,
+    OBJECT_OT_RbxDecalExportScript,
+    sync_ui_decal_list,
+)
 
 __all__ = [
     # Import operators
@@ -104,6 +114,15 @@ __all__ = [
     # Server operators
     "StartServerOperator",
     "StopServerOperator",
+    # Decal operators
+    "OBJECT_OT_RbxDecalScan",
+    "OBJECT_OT_RbxDecalImportImages",
+    "OBJECT_OT_RbxDecalSolo",
+    "OBJECT_OT_RbxDecalQuickSwitch",
+    "OBJECT_OT_RbxDecalKeyframe",
+    "OBJECT_OT_RbxDecalClearKeyframes",
+    "OBJECT_OT_RbxDecalExportScript",
+    "sync_ui_decal_list",
     # Test operators
     "OBJECT_OT_RunTests",
     # OAuth operators
