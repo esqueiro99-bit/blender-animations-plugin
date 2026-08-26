@@ -1,0 +1,54 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://raw.githubusercontent.com/MaximumADHD/Roblox-File-Format/main/Roblox.xsd" version="4">
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX000000000001">
+		<Properties>
+			<string name="Name">BlenderAnimsMinimalTest</string>
+			<ProtectedString name="Source"><![CDATA[
+-- MINIMAL TEST PLUGIN - Diagnostics only, no dependencies
+-- This bypasses all Fusion/service complexity to confirm DockWidget works
+
+local toolbar = plugin:CreateToolbar("Blender Anims TEST")
+local btn = toolbar:CreateButton("BA Test", "Open test window", "")
+
+local info = DockWidgetPluginGuiInfo.new(
+	Enum.InitialDockState.Float,
+	false,
+	false,
+	300, 200,
+	200, 100
+)
+
+local widget = plugin:CreateDockWidgetPluginGui("BlenderAnimsTest_v1", info)
+widget.Title = "Blender Animations - Diagnostic"
+
+-- Add a label inside
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromScale(1, 1)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.Parent = widget
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.fromScale(1, 1)
+label.BackgroundTransparency = 1
+label.Text = "✅ DockWidget funcionando!\nSe você vê isso, o problema está no script principal."
+label.TextColor3 = Color3.fromRGB(255, 255, 255)
+label.TextWrapped = true
+label.Font = Enum.Font.GothamBold
+label.TextSize = 14
+label.Parent = frame
+
+btn.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+	btn:SetActive(widget.Enabled)
+end)
+
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	btn:SetActive(widget.Enabled)
+end)
+
+print("[BlenderAnims Minimal] Plugin carregado com sucesso!")
+]]></ProtectedString>
+		</Properties>
+	</Item>
+</roblox>

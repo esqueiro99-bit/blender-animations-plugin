@@ -13,30 +13,48 @@
 --!strict
 --!optimize 2
 
+local function safeRequire(module: any, name: string): any
+	local ok, result = pcall(require, module)
+	if not ok then
+		warn("[BlenderAnims ERRO ao carregar modulo '" .. tostring(name) .. "']: " .. tostring(result))
+		return nil
+	end
+	return result
+end
+
 local internal = (script:FindFirstChild("state") and script)
 	or script:FindFirstChild("BlenderAnimationsInternal")
 	or (script.Parent and script.Parent:FindFirstChild("state") and script.Parent)
 	or (script.Parent and script.Parent:FindFirstChild("BlenderAnimationsInternal"))
 	or script
 
-local State = require(internal.state)
-local Types = require(internal.types)
-local PlaybackService = require(internal.Services.PlaybackService)
+print("[BlenderAnims] Iniciando plugin... internal = " .. tostring(internal))
 
+local State = safeRequire(internal.state, "state")
+local Types = safeRequire(internal.types, "types")
+local PlaybackService = safeRequire(internal.Services.PlaybackService, "PlaybackService")
 
 -- Import our new services
-local RigManager = require(internal.Services.RigManager)
-local AnimationManager = require(internal.Services.AnimationManager)
-local BlenderSyncManager = require(internal.Services.BlenderSyncManager)
-local ExportManager = require(internal.Services.ExportManager)
-local CameraManager = require(internal.Services.CameraManager)
+local RigManager = safeRequire(internal.Services.RigManager, "RigManager")
+local AnimationManager = safeRequire(internal.Services.AnimationManager, "AnimationManager")
+local BlenderSyncManager = safeRequire(internal.Services.BlenderSyncManager, "BlenderSyncManager")
+local ExportManager = safeRequire(internal.Services.ExportManager, "ExportManager")
+local CameraManager = safeRequire(internal.Services.CameraManager, "CameraManager")
 
 -- Import UI components
-local PlayerTab = require(internal.UI.Tabs.PlayerTab)
-local RiggingTab = require(internal.UI.Tabs.RiggingTab)
-local ToolsTab = require(internal.UI.Tabs.ToolsTab)
-local MoreTab = require(internal.UI.Tabs.MoreTab)
-local SharedComponents = require(internal.UI.SharedComponents)
+local PlayerTab = safeRequire(internal.UI.Tabs.PlayerTab, "PlayerTab")
+local RiggingTab = safeRequire(internal.UI.Tabs.RiggingTab, "RiggingTab")
+local ToolsTab = safeRequire(internal.UI.Tabs.ToolsTab, "ToolsTab")
+local MoreTab = safeRequire(internal.UI.Tabs.MoreTab, "MoreTab")
+local SharedComponents = safeRequire(internal.UI.SharedComponents, "SharedComponents")
+
+-- Abort if critical modules failed
+if not State or not PlaybackService then
+	warn("[BlenderAnims] ERRO CRITICO: modulos essenciais nao carregaram. Plugin abortado.")
+	return
+end
+
+print("[BlenderAnims] Todos os modulos carregados com sucesso!")
 
 local Plugin = plugin
 
@@ -709,7 +727,7 @@ do -- Creates the plugin
 			ForceInitialEnabled = false,
 			FloatingSize = Vector2.new(250, 600),
 			MinimumSize = Vector2.new(250, 600),
-			Enabled = State.widgetsEnabled,
+			-- NOTE: Enabled is NOT passed here — we manage widget.Enabled directly below
 			[Children] = New("Frame")({
 				Size = UDim2.fromScale(1, 1),
 				BackgroundTransparency = 1,
@@ -4330,7 +4348,6 @@ end</string>
             <string name="Source">local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
 
 local Hydrate = Fusion.Hydrate
-local Observer = Fusion.Observer
 
 local COMPONENT_ONLY_PROPERTIES = {
 	"Id",
@@ -4340,7 +4357,6 @@ local COMPONENT_ONLY_PROPERTIES = {
 	"FloatingSize",
 	"MinimumSize",
 	"Plugin",
-	"Enabled", -- we handle Enabled manually below
 }
 
 type PluginGuiProperties = {
@@ -4355,13 +4371,6 @@ type PluginGuiProperties = {
 	[any]: any,
 }
 
-local function unwrap(value: any): any
-	if typeof(value) == "table" and value.get then
-		return value:get()
-	end
-	return value
-end
-
 return function(props: PluginGuiProperties)
 	local PluginInstance = props.Plugin
 	assert(PluginInstance, "Widget requires a 'Plugin' property to be passed")
@@ -4375,8 +4384,8 @@ return function(props: PluginGuiProperties)
 		widgetId,
 		DockWidgetPluginGuiInfo.new(
 			dockState,
-			false, -- InitialEnabled
-			false, -- ForceInitialEnabled
+			false,
+			false,
 			props.FloatingSize and props.FloatingSize.X or 300,
 			props.FloatingSize and props.FloatingSize.Y or 600,
 			props.MinimumSize and props.MinimumSize.X or 220,
@@ -4387,35 +4396,17 @@ return function(props: PluginGuiProperties)
 	newWidget.Title = props.Name or "Blender Animations"
 	newWidget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-	-- Handle Enabled reactivity manually:
-	-- If a Fusion Value/State is passed, observe it and push changes into the widget directly.
-	local enabledProp = props.Enabled
-	if typeof(enabledProp) == "table" and enabledProp.get then
-		-- Initial apply (don't sync widget -> state, only state -> widget)
-		newWidget.Enabled = unwrap(enabledProp)
-		-- Watch for future changes and apply them to the real DockWidget
-		local obs = Observer(enabledProp)
-		PluginInstance.Unloading:Connect(obs:onChange(function()
-			local v = unwrap(enabledProp)
-			if newWidget.Enabled ~= v then
-				newWidget.Enabled = v
-			end
-		end))
+	-- Remove special props that DockWidgetPluginGui doesn't accept
+	-- We strip Enabled too — caller manages it directly on the returned instance
+	for _, propertyName in ipairs(COMPONENT_ONLY_PROPERTIES) do
+		props[propertyName] = nil
 	end
+	props.Name = nil
+	props.Title = nil
+	props.Enabled = nil  -- caller sets widget.Enabled directly; don't let Fusion fight us
 
-	-- Build hydrate props without Enabled and other special keys
-	local hydrateProps = {}
-	for k, v in pairs(props) do
-		local skip = false
-		for _, name in ipairs(COMPONENT_ONLY_PROPERTIES) do
-			if k == name then skip = true; break end
-		end
-		if k ~= "Name" and k ~= "Title" and not skip then
-			hydrateProps[k] = v
-		end
-	end
-
-	return Hydrate(newWidget)(hydrateProps)
+	-- Hydrate remaining props (Children, ZIndexBehavior, etc.) onto the widget
+	return Hydrate(newWidget)(props)
 end</string>
           </Properties>
         </Item>

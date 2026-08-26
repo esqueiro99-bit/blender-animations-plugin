@@ -8,30 +8,48 @@
 --!strict
 --!optimize 2
 
+local function safeRequire(module: any, name: string): any
+	local ok, result = pcall(require, module)
+	if not ok then
+		warn("[BlenderAnims ERRO ao carregar modulo '" .. tostring(name) .. "']: " .. tostring(result))
+		return nil
+	end
+	return result
+end
+
 local internal = (script:FindFirstChild("state") and script)
 	or script:FindFirstChild("BlenderAnimationsInternal")
 	or (script.Parent and script.Parent:FindFirstChild("state") and script.Parent)
 	or (script.Parent and script.Parent:FindFirstChild("BlenderAnimationsInternal"))
 	or script
 
-local State = require(internal.state)
-local Types = require(internal.types)
-local PlaybackService = require(internal.Services.PlaybackService)
+print("[BlenderAnims] Iniciando plugin... internal = " .. tostring(internal))
 
+local State = safeRequire(internal.state, "state")
+local Types = safeRequire(internal.types, "types")
+local PlaybackService = safeRequire(internal.Services.PlaybackService, "PlaybackService")
 
 -- Import our new services
-local RigManager = require(internal.Services.RigManager)
-local AnimationManager = require(internal.Services.AnimationManager)
-local BlenderSyncManager = require(internal.Services.BlenderSyncManager)
-local ExportManager = require(internal.Services.ExportManager)
-local CameraManager = require(internal.Services.CameraManager)
+local RigManager = safeRequire(internal.Services.RigManager, "RigManager")
+local AnimationManager = safeRequire(internal.Services.AnimationManager, "AnimationManager")
+local BlenderSyncManager = safeRequire(internal.Services.BlenderSyncManager, "BlenderSyncManager")
+local ExportManager = safeRequire(internal.Services.ExportManager, "ExportManager")
+local CameraManager = safeRequire(internal.Services.CameraManager, "CameraManager")
 
 -- Import UI components
-local PlayerTab = require(internal.UI.Tabs.PlayerTab)
-local RiggingTab = require(internal.UI.Tabs.RiggingTab)
-local ToolsTab = require(internal.UI.Tabs.ToolsTab)
-local MoreTab = require(internal.UI.Tabs.MoreTab)
-local SharedComponents = require(internal.UI.SharedComponents)
+local PlayerTab = safeRequire(internal.UI.Tabs.PlayerTab, "PlayerTab")
+local RiggingTab = safeRequire(internal.UI.Tabs.RiggingTab, "RiggingTab")
+local ToolsTab = safeRequire(internal.UI.Tabs.ToolsTab, "ToolsTab")
+local MoreTab = safeRequire(internal.UI.Tabs.MoreTab, "MoreTab")
+local SharedComponents = safeRequire(internal.UI.SharedComponents, "SharedComponents")
+
+-- Abort if critical modules failed
+if not State or not PlaybackService then
+	warn("[BlenderAnims] ERRO CRITICO: modulos essenciais nao carregaram. Plugin abortado.")
+	return
+end
+
+print("[BlenderAnims] Todos os modulos carregados com sucesso!")
 
 local Plugin = plugin
 
@@ -704,7 +722,7 @@ do -- Creates the plugin
 			ForceInitialEnabled = false,
 			FloatingSize = Vector2.new(250, 600),
 			MinimumSize = Vector2.new(250, 600),
-			Enabled = State.widgetsEnabled,
+			-- NOTE: Enabled is NOT passed here — we manage widget.Enabled directly below
 			[Children] = New("Frame")({
 				Size = UDim2.fromScale(1, 1),
 				BackgroundTransparency = 1,
